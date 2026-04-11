@@ -26,6 +26,10 @@ class MobileSAMSegmenter(private val context: Context) {
 
     private var isModelLoaded = false
 
+    // Cached encoder results for interactive point-prompt segmentation
+    private var cachedEncoderResults: EncoderResults? = null
+    private var cachedBitmapHash: Int = 0
+
     private val encoderPath = "models/mobile_sam/mobile_sam_image_encoder.onnx"
     private val decoderPath = "models/mobile_sam/sam_mask_decoder_single.onnx"
 
@@ -119,6 +123,62 @@ class MobileSAMSegmenter(private val context: Context) {
             }
         }
         Log.i(TAG, "Copied $assetPath to ${destFile.absolutePath}")
+    }
+
+    /**
+     * Interactive point-prompt segmentation.
+     * Runs the encoder once (cached) and decoder for the given point.
+     * Returns the mask bitmap for the object under the tap point.
+     */
+    suspend fun segmentAtPoint(bitmap: Bitmap, pointX: Float, pointY: Float): Bitmap? {
+        if (!isModelLoaded || encoderSession == null || decoderSession == null) {
+            Log.w(TAG, "Model not loaded. Call loadModel() first.")
+            return null
+        }
+
+        return withContext(Dispatchers.Default) {
+            try {
+                val bitmapHash = System.identityHashCode(bitmap)
+
+                // Run encoder only if not cached for this bitmap
+                if (cachedEncoderResults == null || cachedBitmapHash != bitmapHash) {
+                    Log.i(TAG, "Running encoder for new image (${bitmap.width}x${bitmap.height})")
+                    val encoderStart = System.currentTimeMillis()
+                    cachedEncoderResults = runEncoder(bitmap)
+                    cachedBitmapHash = bitmapHash
+                    val encoderTime = System.currentTimeMillis() - encoderStart
+                    Log.i(TAG, "Encoder completed in ${encoderTime}ms (cached for reuse)")
+                } else {
+                    Log.i(TAG, "Using cached encoder results")
+                }
+
+                val encoderResults = cachedEncoderResults ?: run {
+                    Log.e(TAG, "Encoder failed")
+                    return@withContext null
+                }
+
+                // Run decoder for the single point
+                val decoderStart = System.currentTimeMillis()
+                val mask = runDecoder(encoderResults, pointX, pointY, bitmap.width, bitmap.height)
+                val decoderTime = System.currentTimeMillis() - decoderStart
+                Log.i(TAG, "Decoder completed in ${decoderTime}ms for point ($pointX, $pointY)")
+
+                mask
+            } catch (e: Exception) {
+                Log.e(TAG, "segmentAtPoint failed: ${e.message}")
+                e.printStackTrace()
+                null
+            }
+        }
+    }
+
+    /**
+     * Clear the cached encoder results to free memory.
+     */
+    fun clearCache() {
+        cachedEncoderResults = null
+        cachedBitmapHash = 0
+        Log.i(TAG, "Encoder cache cleared")
     }
 
     suspend fun segmentImage(bitmap: Bitmap, numPoints: Int = 32): ImageObjects? {

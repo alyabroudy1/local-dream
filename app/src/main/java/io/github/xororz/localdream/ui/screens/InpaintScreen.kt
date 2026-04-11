@@ -7,6 +7,7 @@ import android.graphics.Paint
 import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
+import android.util.Log
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -39,6 +40,7 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.activity.compose.BackHandler
 import androidx.compose.ui.res.stringResource
 import kotlinx.coroutines.Dispatchers
@@ -51,13 +53,15 @@ import kotlin.math.sqrt
 import android.content.Context
 import androidx.compose.ui.graphics.Color as ComposeColor
 import io.github.xororz.localdream.R
+import io.github.xororz.localdream.ml.MobileSAMSegmenter
 import androidx.core.content.edit
 import androidx.compose.ui.draw.clipToBounds
 import androidx.core.graphics.createBitmap
 
 enum class ToolMode {
     BRUSH,
-    ERASER
+    ERASER,
+    SMART_SELECT
 }
 
 data class PathData(
@@ -89,7 +93,32 @@ fun InpaintScreen(
 
     var brushColor by remember { mutableStateOf(savedColor) }
     var showColorPicker by remember { mutableStateOf(false) }
-    var currentToolMode by remember { mutableStateOf(ToolMode.valueOf(savedToolMode)) }
+    var currentToolMode by remember { mutableStateOf(
+        try { ToolMode.valueOf(savedToolMode) } catch (_: Exception) { ToolMode.BRUSH }
+    ) }
+
+    // Smart Select (MobileSAM) state
+    val samSegmenter = remember { MobileSAMSegmenter(context) }
+    var isSamModelLoaded by remember { mutableStateOf(false) }
+    var isSamProcessing by remember { mutableStateOf(false) }
+    var samLoadingMessage by remember { mutableStateOf("") }
+
+    // Load SAM model in background on first compose
+    LaunchedEffect(Unit) {
+        isSamModelLoaded = samSegmenter.loadModel()
+        if (isSamModelLoaded) {
+            Log.i("InpaintScreen", "MobileSAM model loaded")
+        } else {
+            Log.w("InpaintScreen", "MobileSAM model failed to load")
+        }
+    }
+
+    // Clean up SAM cache on dispose
+    DisposableEffect(Unit) {
+        onDispose {
+            samSegmenter.clearCache()
+        }
+    }
 
     LaunchedEffect(currentToolMode) {
         sharedPrefs.edit { putString("tool_mode", currentToolMode.name) }
@@ -244,10 +273,14 @@ fun InpaintScreen(
         }
 
         pathHistory.forEach { pathData ->
+            // SMART_SELECT masks are merged directly into maskBitmap, skip path drawing
+            if (pathData.mode == ToolMode.SMART_SELECT) return@forEach
+
             if (pathData.points.size > 1) {
                 val paint = when (pathData.mode) {
                     ToolMode.BRUSH -> brushPaint.apply { color = pathData.color }
                     ToolMode.ERASER -> eraserPaint
+                    ToolMode.SMART_SELECT -> return@forEach
                 }
 
                 paint.strokeWidth = pathData.size
@@ -261,11 +294,19 @@ fun InpaintScreen(
             }
         }
 
+        // Draw the maskBitmap which contains SMART_SELECT masks
+        val maskPaint = Paint().apply {
+            colorFilter = android.graphics.PorterDuffColorFilter(brushColor, PorterDuff.Mode.SRC_IN)
+        }
+        canvas.drawBitmap(maskBitmap, 0f, 0f, maskPaint)
+
         if (isDrawing && currentPathPoints.size > 1) {
             val paint = when (currentToolMode) {
                 ToolMode.BRUSH -> brushPaint
                 ToolMode.ERASER -> eraserPaint
+                ToolMode.SMART_SELECT -> null
             }
+            if (paint == null) return // SMART_SELECT doesn't draw strokes
 
             paint.strokeWidth = convertDpToImagePixels(
                 brushSizeDpValue,
@@ -285,6 +326,47 @@ fun InpaintScreen(
             tempBitmap.copy(tempBitmap.config ?: Bitmap.Config.ARGB_8888, true).asImageBitmap()
     }
 
+    fun handleSmartSelectTap(imagePoint: Offset) {
+        if (!isSamModelLoaded || isSamProcessing) return
+        coroutineScope.launch {
+            isSamProcessing = true
+            samLoadingMessage = "Analyzing..."
+            try {
+                val mask = samSegmenter.segmentAtPoint(
+                    originalBitmap,
+                    imagePoint.x,
+                    imagePoint.y
+                )
+                if (mask != null) {
+                    // Merge SAM mask into the display mask (additive)
+                    val canvas = Canvas(maskBitmap)
+                    val paint = Paint().apply {
+                        xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_OVER)
+                    }
+                    canvas.drawBitmap(mask, 0f, 0f, paint)
+
+                    // Add as a path entry for undo support
+                    pathHistory.add(
+                        PathData(
+                            points = listOf(imagePoint),
+                            size = 0f,
+                            mode = ToolMode.SMART_SELECT,
+                            color = Color.WHITE
+                        )
+                    )
+                    redoStack.clear()
+                    updateDisplayMask()
+                    Log.i("InpaintScreen", "Smart Select mask merged for point (${imagePoint.x}, ${imagePoint.y})")
+                }
+            } catch (e: Exception) {
+                Log.e("InpaintScreen", "Smart Select failed: ${e.message}", e)
+            } finally {
+                isSamProcessing = false
+                samLoadingMessage = ""
+            }
+        }
+    }
+
     fun processMask() {
         coroutineScope.launch {
             isLoading = true
@@ -300,9 +382,25 @@ fun InpaintScreen(
                 for (pathData in pathHistory) {
                     if (pathData.points.isEmpty()) continue
 
+                    // SMART_SELECT: re-run SAM to rebuild the mask
+                    if (pathData.mode == ToolMode.SMART_SELECT) {
+                        val samMask = kotlinx.coroutines.runBlocking {
+                            samSegmenter.segmentAtPoint(
+                                originalBitmap,
+                                pathData.points[0].x,
+                                pathData.points[0].y
+                            )
+                        }
+                        if (samMask != null) {
+                            finalMaskCanvas.drawBitmap(samMask, 0f, 0f, null)
+                        }
+                        continue
+                    }
+
                     val paint = when (pathData.mode) {
                         ToolMode.BRUSH -> finalPaint
                         ToolMode.ERASER -> eraserPaint
+                        ToolMode.SMART_SELECT -> continue
                     }
 
                     paint.strokeWidth = pathData.size
@@ -493,6 +591,14 @@ fun InpaintScreen(
 
                                 val contentPos = touchToContent(firstDown.position)
                                 val firstImgPt = mapToImageCoordinate(contentPos)
+
+                                // Smart Select: single tap to segment
+                                if (currentToolMode == ToolMode.SMART_SELECT && firstImgPt != null) {
+                                    handleSmartSelectTap(firstImgPt)
+                                    // Consume the gesture and skip drawing
+                                    return@awaitEachGesture
+                                }
+
                                 if (firstImgPt != null) {
                                     drawStarted = true
                                     isDrawing = true
@@ -656,7 +762,7 @@ fun InpaintScreen(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Row(
-                                modifier = Modifier.width(80.dp),
+                                modifier = Modifier.width(120.dp),
                                 horizontalArrangement = Arrangement.SpaceEvenly
                             ) {
                                 Box(
@@ -724,8 +830,47 @@ fun InpaintScreen(
                                         )
                                     }
                                 }
+
+                                // Smart Select (MobileSAM tap-to-segment)
+                                Box(
+                                    modifier = Modifier.size(36.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (currentToolMode == ToolMode.SMART_SELECT) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(36.dp)
+                                                .clip(CircleShape)
+                                                .background(
+                                                    MaterialTheme.colorScheme.primary.copy(
+                                                        alpha = 0.15f
+                                                    )
+                                                )
+                                        )
+                                    }
+
+                                    IconButton(
+                                        onClick = { currentToolMode = ToolMode.SMART_SELECT },
+                                        modifier = Modifier.size(36.dp),
+                                        enabled = isSamModelLoaded
+                                    ) {
+                                        Icon(
+                                            Icons.Default.AutoFixHigh,
+                                            contentDescription = "Smart Select",
+                                            tint = if (currentToolMode == ToolMode.SMART_SELECT)
+                                                MaterialTheme.colorScheme.primary
+                                            else if (!isSamModelLoaded)
+                                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f)
+                                            else
+                                                MaterialTheme.colorScheme.onSurface,
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                    }
+                                }
                             }
 
+                            // Only show slider and color when in Brush/Eraser mode
+                            if (currentToolMode != ToolMode.SMART_SELECT) {
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
@@ -768,6 +913,23 @@ fun InpaintScreen(
                                             }
                                         }
                                 )
+                            }
+                            } else {
+                                // Smart Select mode: show hint text instead of slider
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(horizontal = 8.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        if (isSamProcessing) "Analyzing..."
+                                        else "Tap on object to select",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                                        fontSize = 12.sp
+                                    )
+                                }
                             }
                         }
 
@@ -823,6 +985,39 @@ fun InpaintScreen(
                         modifier = Modifier.size(64.dp),
                         color = MaterialTheme.colorScheme.onPrimary
                     )
+                }
+            }
+
+            if (isSamProcessing) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(ComposeColor.Black.copy(alpha = 0.3f))
+                        .pointerInput(Unit) {},
+                    contentAlignment = Alignment.Center
+                ) {
+                    Card(
+                        shape = MaterialTheme.shapes.medium,
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.95f)
+                        ),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(24.dp),
+                                strokeWidth = 2.dp
+                            )
+                            Text(
+                                "Analyzing...",
+                                style = MaterialTheme.typography.bodyMedium
+                            )
+                        }
+                    }
                 }
             }
 

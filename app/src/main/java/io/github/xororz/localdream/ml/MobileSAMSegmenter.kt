@@ -294,34 +294,65 @@ class MobileSAMSegmenter(private val context: Context) {
 
     private fun runEncoder(bitmap: Bitmap): EncoderResults? {
         return try {
-            Log.i(TAG, "runEncoder: starting")
-            
-            val resized = Bitmap.createScaledBitmap(bitmap, inputDim, inputDim, true)
-            Log.i(TAG, "runEncoder: resized to ${resized.width}x${resized.height}")
+            Log.i(TAG, "runEncoder: starting, input ${bitmap.width}x${bitmap.height}")
 
+            // SAM expects longest side = 1024 with aspect ratio preserved, padded to square
+            val origW = bitmap.width
+            val origH = bitmap.height
+            val maxDim = maxOf(origW, origH)
+            val scaleToFit = inputDim.toFloat() / maxDim
+            val newW = (origW * scaleToFit).toInt()
+            val newH = (origH * scaleToFit).toInt()
+
+            val resized = Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+            Log.i(TAG, "runEncoder: resized to ${resized.width}x${resized.height} (fit in $inputDim)")
+
+            // NCHW format: (1, 3, 1024, 1024) - channel-first with zero padding
             val pixels = FloatBuffer.allocate(1 * 3 * inputDim * inputDim)
             pixels.rewind()
 
-            for (i in 0 until inputDim) {
-                for (j in 0 until inputDim) {
-                    val pixel = resized[j, i]
-                    val r = ((Color.red(pixel) / 255.0f) - mean[0]) / std[0]
-                    val g = ((Color.green(pixel) / 255.0f) - mean[1]) / std[1]
-                    val b = ((Color.blue(pixel) / 255.0f) - mean[2]) / std[2]
-                    pixels.put(r)
-                    pixels.put(g)
-                    pixels.put(b)
+            // Channel R (all R values first)
+            for (y in 0 until inputDim) {
+                for (x in 0 until inputDim) {
+                    if (x < newW && y < newH) {
+                        val pixel = resized.getPixel(x, y)
+                        pixels.put(((Color.red(pixel) / 255.0f) - mean[0]) / std[0])
+                    } else {
+                        pixels.put(0f) // Zero padding
+                    }
+                }
+            }
+            // Channel G
+            for (y in 0 until inputDim) {
+                for (x in 0 until inputDim) {
+                    if (x < newW && y < newH) {
+                        val pixel = resized.getPixel(x, y)
+                        pixels.put(((Color.green(pixel) / 255.0f) - mean[1]) / std[1])
+                    } else {
+                        pixels.put(0f)
+                    }
+                }
+            }
+            // Channel B
+            for (y in 0 until inputDim) {
+                for (x in 0 until inputDim) {
+                    if (x < newW && y < newH) {
+                        val pixel = resized.getPixel(x, y)
+                        pixels.put(((Color.blue(pixel) / 255.0f) - mean[2]) / std[2])
+                    } else {
+                        pixels.put(0f)
+                    }
                 }
             }
             pixels.rewind()
-            Log.i(TAG, "runEncoder: pixel buffer prepared")
+            Log.i(TAG, "runEncoder: NCHW pixel buffer prepared (channel-first)")
 
             val inputTensor = ai.onnxruntime.OnnxTensor.createTensor(
                 ortEnvironment!!,
                 pixels,
-                longArrayOf(inputDim.toLong(), inputDim.toLong(), 3)
+                longArrayOf(1, 3, inputDim.toLong(), inputDim.toLong())
             )
-            Log.i(TAG, "runEncoder: input tensor created")
+            Log.i(TAG, "runEncoder: input tensor shape [1, 3, $inputDim, $inputDim]")
 
             val outputs = encoderSession!!.run(mapOf(encoderInputName to inputTensor))
             Log.i(TAG, "runEncoder: inference done")
@@ -351,12 +382,17 @@ class MobileSAMSegmenter(private val context: Context) {
                 return null
             }
 
-            val scaleX = imgWidth.toFloat() / inputDim
-            val scaleY = imgHeight.toFloat() / inputDim
+            // Transform point from original image space to encoder's padded 1024x1024 space
+            val maxDim = maxOf(imgWidth, imgHeight)
+            val scaleToEncoder = inputDim.toFloat() / maxDim
+            val encoderPointX = pointX * scaleToEncoder
+            val encoderPointY = pointY * scaleToEncoder
+            
+            Log.i(TAG, "runDecoder: encoder point=($encoderPointX, $encoderPointY), scale=$scaleToEncoder")
 
             val pointCoords = FloatBuffer.wrap(floatArrayOf(
-                pointX / scaleX, pointY / scaleY,
-                0.0f, 0.0f // Padding point required by SAM ONNX for "no bounding box" queries
+                encoderPointX, encoderPointY,
+                0.0f, 0.0f // Padding point required by SAM ONNX
             ))
             val pointLabels = FloatBuffer.wrap(floatArrayOf(
                 1.0f,  // Foreground positive point
@@ -413,24 +449,44 @@ class MobileSAMSegmenter(private val context: Context) {
             val outputs = decoderSession!!.run(inputMap)
             Log.i(TAG, "runDecoder: inference done")
 
-            val maskBuffer = (outputs[inputs.maskOutputName].get() as ai.onnxruntime.OnnxTensor).floatBuffer
-            Log.i(TAG, "runDecoder: mask capacity: ${maskBuffer.capacity()}")
+            val maskTensor = outputs[inputs.maskOutputName].get() as ai.onnxruntime.OnnxTensor
+            val maskBuffer = maskTensor.floatBuffer
+            val maskShape = maskTensor.info.shape
+            Log.i(TAG, "runDecoder: mask shape=${maskShape.toList()}, capacity=${maskBuffer.capacity()}")
 
-            val maskBitmap = Bitmap.createBitmap(imgWidth, imgHeight, Bitmap.Config.ARGB_8888)
+            // Determine mask dimensions from output shape
+            // Output is typically (1, 1, H, W) or (1, H, W) or (H, W)
+            val maskH: Int
+            val maskW: Int
+            when (maskShape.size) {
+                4 -> { maskH = maskShape[2].toInt(); maskW = maskShape[3].toInt() }
+                3 -> { maskH = maskShape[1].toInt(); maskW = maskShape[2].toInt() }
+                2 -> { maskH = maskShape[0].toInt(); maskW = maskShape[1].toInt() }
+                else -> { maskH = imgHeight; maskW = imgWidth }
+            }
+            Log.i(TAG, "runDecoder: mask dims=${maskW}x${maskH}")
+
+            // Create mask at the decoder output resolution
+            val rawMask = Bitmap.createBitmap(maskW, maskH, Bitmap.Config.ARGB_8888)
             var whiteCount = 0
-            for (i in 0 until imgHeight) {
-                for (j in 0 until imgWidth) {
-                    val idx = j + i * imgWidth
+            for (y in 0 until maskH) {
+                for (x in 0 until maskW) {
+                    val idx = x + y * maskW
                     if (idx < maskBuffer.capacity() && maskBuffer.get(idx) > 0f) {
-                        maskBitmap[j, i] = Color.WHITE
+                        rawMask.setPixel(x, y, Color.WHITE)
                         whiteCount++
-                    } else {
-                        maskBitmap[j, i] = Color.TRANSPARENT
                     }
                 }
             }
+            Log.i(TAG, "runDecoder: white pixels: $whiteCount / ${maskW * maskH}")
 
-            Log.i(TAG, "runDecoder: white pixels: $whiteCount")
+            // Scale mask to original image dimensions if needed
+            val maskBitmap = if (maskW != imgWidth || maskH != imgHeight) {
+                Bitmap.createScaledBitmap(rawMask, imgWidth, imgHeight, false)
+            } else {
+                rawMask
+            }
+
             maskBitmap
         } catch (e: Exception) {
             Log.e(TAG, "Decoder error: ${e.message}")

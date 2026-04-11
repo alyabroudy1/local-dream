@@ -7,4 +7,5 @@ sealed class Screen(val route: String) {
     }
 
     object Upscale : Screen("upscale")
+    object ObjectSelection : Screen("object_selection")
 }

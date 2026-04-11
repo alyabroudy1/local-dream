@@ -369,6 +369,7 @@ fun ModelRunScreen(
     var croppedBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     var showInpaintScreen by remember { mutableStateOf(false) }
+    var showObjectSelectionScreen by remember { mutableStateOf(false) }
     var maskBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var isInpaintMode by remember { mutableStateOf(false) }
     var savedPathHistory by remember { mutableStateOf<List<PathData>?>(null) }
@@ -1855,6 +1856,27 @@ fun ModelRunScreen(
                                 FilledTonalIconButton(
                                     onClick = {
                                         if (croppedBitmap != null) {
+                                            showObjectSelectionScreen = true
+                                        } else {
+                                            Toast.makeText(
+                                                context,
+                                                "Please Crop First",
+                                                Toast.LENGTH_SHORT
+                                            ).show()
+                                        }
+                                    },
+                                    shape = CircleShape,
+                                    modifier = Modifier.size(40.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.AutoFixHigh,
+                                        contentDescription = "Auto Detect Objects",
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(12.dp))
+                                FilledTonalIconButton(
+                                    onClick = {
+                                        if (croppedBitmap != null) {
                                             showInpaintScreen = true
                                         } else {
                                             Toast.makeText(
@@ -2857,6 +2879,26 @@ fun ModelRunScreen(
                 }
             )
         }
+
+        if (showObjectSelectionScreen && croppedBitmap != null) {
+            ObjectSelectionScreen(
+                originalBitmap = croppedBitmap!!,
+                onObjectSelected = { maskBmp, selectedObject ->
+                    maskBitmap = maskBmp
+                    isInpaintMode = true
+                    showObjectSelectionScreen = false
+                    showInpaintScreen = true
+                },
+                onAnalyzeComplete = { imageObjects ->
+                    if (imageObjects.objects.isNotEmpty()) {
+                        Toast.makeText(context, "${imageObjects.objects.size} objects detected", Toast.LENGTH_SHORT).show()
+                    }
+                },
+                onCancel = {
+                    showObjectSelectionScreen = false
+                }
+            )
+        }
     }
     if (isPreviewMode && currentBitmap != null) {
         BackHandler {
@@ -3344,6 +3386,146 @@ fun ModelRunScreen(
                     .padding(top = 60.dp, end = 16.dp),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
+                // Edit & Reproduce button
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .background(
+                            color = Color.Black.copy(alpha = 0.5f),
+                            shape = CircleShape
+                        )
+                        .clickable {
+                            if (selectedHistoryItem != null) {
+                                scope.launch {
+                                    // Load params if not yet loaded
+                                    var item = selectedHistoryItem!!
+                                    if (item.params == null) {
+                                        val loadedParams =
+                                            historyManager.loadHistoryItemParams(item)
+                                        if (loadedParams != null) {
+                                            item = item.copy(params = loadedParams)
+                                            val index = historyItems.indexOf(selectedHistoryItem!!)
+                                            if (index != -1) {
+                                                historyItems[index] = item
+                                            }
+                                            selectedHistoryItem = item
+                                        }
+                                    }
+                                    val params = item.params
+                                    if (params != null) {
+                                        // Apply ALL params including seed
+                                        prompt = params.prompt
+                                        negativePrompt = params.negativePrompt
+                                        cfg = params.cfg
+                                        steps = params.steps.toFloat()
+                                        seed = params.seed?.toString() ?: ""
+                                        scheduler = params.scheduler
+                                        saveAllFields()
+
+                                        // Close the dialog and navigate to prompt page
+                                        showHistoryDetailDialog = false
+                                        selectedHistoryItem = null
+                                        pagerState.animateScrollToPage(0)
+                                    }
+                                }
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.AutoFixHigh,
+                        contentDescription = "Edit & Reproduce",
+                        tint = Color.White
+                    )
+                }
+
+                // Inpaint button - open inpaint screen with history image
+                Box(
+                    modifier = Modifier
+                        .size(40.dp)
+                        .background(
+                            color = Color.Black.copy(alpha = 0.5f),
+                            shape = CircleShape
+                        )
+                        .clickable {
+                            if (selectedHistoryItem != null && historyBitmap != null) {
+                                scope.launch {
+                                    // Load params if not yet loaded
+                                    var item = selectedHistoryItem!!
+                                    if (item.params == null) {
+                                        val loadedParams =
+                                            historyManager.loadHistoryItemParams(item)
+                                        if (loadedParams != null) {
+                                            item = item.copy(params = loadedParams)
+                                            val index = historyItems.indexOf(selectedHistoryItem!!)
+                                            if (index != -1) {
+                                                historyItems[index] = item
+                                            }
+                                            selectedHistoryItem = item
+                                        }
+                                    }
+                                    val params = item.params
+                                    if (params != null) {
+                                        // Apply ALL params including seed
+                                        prompt = params.prompt
+                                        negativePrompt = params.negativePrompt
+                                        cfg = params.cfg
+                                        steps = params.steps.toFloat()
+                                        seed = params.seed?.toString() ?: ""
+                                        scheduler = params.scheduler
+                                        saveAllFields()
+                                    }
+
+                                    // Save history bitmap as base64 to tmp.txt for img2img
+                                    withContext(Dispatchers.IO) {
+                                        try {
+                                            val byteArrayOutputStream =
+                                                java.io.ByteArrayOutputStream()
+                                            historyBitmap.compress(
+                                                Bitmap.CompressFormat.PNG,
+                                                100,
+                                                byteArrayOutputStream
+                                            )
+                                            val byteArray = byteArrayOutputStream.toByteArray()
+                                            val base64String =
+                                                java.util.Base64.getEncoder()
+                                                    .encodeToString(byteArray)
+                                            val tmpFile = File(context.filesDir, "tmp.txt")
+                                            tmpFile.writeText(base64String)
+                                        } catch (e: Exception) {
+                                            Log.e(
+                                                "ModelRunScreen",
+                                                "Failed to save history image for inpaint",
+                                                e
+                                            )
+                                        }
+                                    }
+
+                                    // Set up inpaint state
+                                    croppedBitmap = historyBitmap
+                                    selectedImageUri = Uri.fromFile(item.imageFile)
+                                    base64EncodeDone = true
+                                    isInpaintMode = false
+                                    maskBitmap = null
+                                    savedPathHistory = null
+
+                                    // Close detail dialog, go to prompt page, then open inpaint
+                                    showHistoryDetailDialog = false
+                                    selectedHistoryItem = null
+                                    pagerState.animateScrollToPage(0)
+                                    showInpaintScreen = true
+                                }
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Brush,
+                        contentDescription = "Inpaint",
+                        tint = Color.White
+                    )
+                }
+
                 // Info button
                 Box(
                     modifier = Modifier
@@ -3543,14 +3725,38 @@ fun ModelRunScreen(
                     }
                 },
                 confirmButton = {
-                    TextButton(
-                        onClick = {
-                            // Show seed confirmation dialog
-                            showHistoryParametersDialog = false
-                            showSeedConfirmDialog = true
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(
+                            onClick = {
+                                // Direct edit & reproduce: load ALL params including seed
+                                val p = params
+                                prompt = p.prompt
+                                negativePrompt = p.negativePrompt
+                                cfg = p.cfg
+                                steps = p.steps.toFloat()
+                                seed = p.seed?.toString() ?: ""
+                                scheduler = p.scheduler
+                                saveAllFields()
+
+                                showHistoryParametersDialog = false
+                                showHistoryDetailDialog = false
+                                selectedHistoryItem = null
+                                scope.launch {
+                                    pagerState.animateScrollToPage(0)
+                                }
+                            }
+                        ) {
+                            Text(stringResource(R.string.edit_and_reproduce))
                         }
-                    ) {
-                        Text(stringResource(R.string.reproduce))
+                        TextButton(
+                            onClick = {
+                                // Show seed confirmation dialog
+                                showHistoryParametersDialog = false
+                                showSeedConfirmDialog = true
+                            }
+                        ) {
+                            Text(stringResource(R.string.reproduce))
+                        }
                     }
                 },
                 dismissButton = {

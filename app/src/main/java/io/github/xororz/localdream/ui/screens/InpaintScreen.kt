@@ -236,6 +236,13 @@ fun InpaintScreen(
         val canvas = Canvas(tempBitmap)
         canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
 
+        if (existingMaskBitmap != null) {
+            val filterPaint = Paint().apply {
+                colorFilter = android.graphics.PorterDuffColorFilter(brushColor, PorterDuff.Mode.SRC_IN)
+            }
+            canvas.drawBitmap(existingMaskBitmap, 0f, 0f, filterPaint)
+        }
+
         pathHistory.forEach { pathData ->
             if (pathData.points.size > 1) {
                 val paint = when (pathData.mode) {
@@ -285,6 +292,10 @@ fun InpaintScreen(
             try {
                 val finalMaskCanvas = Canvas(maskBitmap)
                 finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+
+                if (existingMaskBitmap != null) {
+                    finalMaskCanvas.drawBitmap(existingMaskBitmap, 0f, 0f, null)
+                }
 
                 for (pathData in pathHistory) {
                     if (pathData.points.isEmpty()) continue

@@ -78,6 +78,13 @@ android {
             useLegacyPackaging = true
         }
     }
+    sourceSets {
+        getByName("main") {
+            jniLibs {
+                srcDirs("src/main/libs")
+            }
+        }
+    }
     flavorDimensions += "version"
     productFlavors {
         create("basic") {
@@ -116,6 +123,7 @@ dependencies {
     implementation(libs.material3.xml)
     implementation(libs.coil.compose)
     implementation(libs.cropify)
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.0")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)

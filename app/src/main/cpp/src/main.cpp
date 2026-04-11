@@ -2526,7 +2526,19 @@ int main(int argc, char **argv) {
                   {"height", result.height},
                   {"channels", result.channels},
                   {"generation_time_ms", result.generation_time_ms},
-                  {"first_step_time_ms", result.first_step_time_ms}};
+                  {"first_step_time_ms", result.first_step_time_ms},
+                  {"params", {
+                      {"prompt", prompt},
+                      {"negative_prompt", negative_prompt},
+                      {"steps", steps},
+                      {"cfg", cfg},
+                      {"seed", seed},
+                      {"scheduler", scheduler_type},
+                      {"denoise_strength", denoise_strength},
+                      {"width", output_width},
+                      {"height", output_height},
+                      {"use_opencl", use_opencl}
+                  }}};
               std::string ev = "event: complete\ndata: " + c.dump() + "\n\n";
               auto send_start = std::chrono::high_resolution_clock::now();
               sink.write(ev.c_str(), ev.size());

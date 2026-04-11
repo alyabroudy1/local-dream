@@ -314,6 +314,31 @@ class BackgroundGenerationService : Service() {
                                     val base64Image = message.optString("image")
                                     val returnedSeed =
                                         message.optLong("seed", -1).takeIf { it != -1L }
+
+                                    // Log the actual params the backend used
+                                    val backendParams = message.optJSONObject("params")
+                                    if (backendParams != null) {
+                                        Log.i(
+                                            "BgGenService",
+                                            "=== Backend confirmed generation params ==="
+                                        )
+                                        Log.i(
+                                            "BgGenService",
+                                            "Prompt: ${backendParams.optString("prompt")}"
+                                        )
+                                        Log.i(
+                                            "BgGenService",
+                                            "Negative: ${backendParams.optString("negative_prompt")}"
+                                        )
+                                        Log.i(
+                                            "BgGenService",
+                                            "Steps: ${backendParams.optInt("steps")} | " +
+                                            "CFG: ${backendParams.optDouble("cfg")} | " +
+                                            "Seed: ${backendParams.optLong("seed")} | " +
+                                            "Scheduler: ${backendParams.optString("scheduler")} | " +
+                                            "Size: ${backendParams.optInt("width")}x${backendParams.optInt("height")}"
+                                        )
+                                    }
                                     val resultWidth = message.optInt("width", 512)
                                     val resultHeight = message.optInt("height", 512)
                                     Log.d(

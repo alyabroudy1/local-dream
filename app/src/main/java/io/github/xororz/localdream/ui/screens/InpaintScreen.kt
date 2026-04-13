@@ -456,135 +456,55 @@ fun InpaintScreen(
         if (smartEditText.isBlank()) return
         val processed = SmartPromptProcessor.process(smartEditText)
         processedPrompt = processed
-        Log.i("InpaintScreen", "Smart Edit: '${smartEditText}' → target=${processed.targetRegion.label}, type=${processed.editType}, prompt='${processed.inpaintPrompt}', denoise=${processed.denoiseStrength}")
+        Log.i("InpaintScreen", "Smart Edit: '${smartEditText}' → target=${processed.targetRegion.label} at (${processed.targetRegion.relativeX}, ${processed.targetRegion.relativeY}), prompt='${processed.inpaintPrompt}', denoise=${processed.denoiseStrength}")
 
         coroutineScope.launch {
             isLoading = true
             isSamProcessing = true
             samLoadingMessage = "Finding ${processed.targetRegion.label}..."
             try {
-                val region = processed.targetRegion
-                val w = originalBitmap.width.toFloat()
-                val h = originalBitmap.height.toFloat()
+                // Calculate target point from region estimation
+                val targetX = (originalBitmap.width * processed.targetRegion.relativeX)
+                val targetY = (originalBitmap.height * processed.targetRegion.relativeY)
+                Log.i("InpaintScreen", "Auto-targeting point (${targetX}, ${targetY}) for '${processed.targetRegion.label}'")
 
-                // ── PASS 1: Find the main person/subject ──
-                samLoadingMessage = "Finding subject..."
-                Log.i("InpaintScreen", "Pass 1: Finding main subject at center")
-                val personMask = withContext(Dispatchers.Default) {
-                    samSegmenter.segmentAtPoint(originalBitmap, w / 2f, h / 2f)
+                // Run SAM at the estimated target point
+                val samMask = withContext(Dispatchers.Default) {
+                    samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
                 }
 
-                if (personMask == null) {
-                    Log.w("InpaintScreen", "Pass 1 failed")
-                    samLoadingMessage = "Could not find subject"
-                    kotlinx.coroutines.delay(2000)
-                    return@launch
-                }
+                if (samMask != null) {
+                    Log.i("InpaintScreen", "SAM auto-mask succeeded: ${samMask.width}x${samMask.height}")
 
-                // Calculate person bounding box
-                var pMinX = personMask.width; var pMinY = personMask.height
-                var pMaxX = 0; var pMaxY = 0
-                for (py in 0 until personMask.height) {
-                    for (px in 0 until personMask.width) {
-                        if (personMask.getPixel(px, py) != Color.TRANSPARENT) {
-                            if (px < pMinX) pMinX = px; if (px > pMaxX) pMaxX = px
-                            if (py < pMinY) pMinY = py; if (py > pMaxY) pMaxY = py
-                        }
+                    // Apply mask to maskBitmap
+                    val finalMaskCanvas = Canvas(maskBitmap)
+                    finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    finalMaskCanvas.drawBitmap(samMask, 0f, 0f, null)
+                    updateDisplayMask()
+
+                    // Encode mask to base64
+                    val base64String = withContext(Dispatchers.Default) {
+                        val byteArrayOutputStream = ByteArrayOutputStream()
+                        maskBitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
+                        val byteArray = byteArrayOutputStream.toByteArray()
+                        Base64.getEncoder().encodeToString(byteArray)
                     }
-                }
-                val personW = (pMaxX - pMinX).toFloat()
-                val personH = (pMaxY - pMinY).toFloat()
-                Log.i("InpaintScreen", "Pass 1: Person bbox ($pMinX,$pMinY)-($pMaxX,$pMaxY) ${personW}x${personH}")
 
-                if (personW < 10 || personH < 10) {
-                    samLoadingMessage = "Subject too small"
-                    kotlinx.coroutines.delay(2000)
-                    return@launch
-                }
-
-                val resultMask: Bitmap
-
-                if (processed.editType == SmartPromptProcessor.EditType.POSE_CHANGE) {
-                    // ── POSE CHANGE: Use rectangular mask with padding ──
-                    // SAM silhouette confines the new pose to the old shape.
-                    // A padded rectangle gives room for the new pose.
-                    samLoadingMessage = "Preparing pose mask..."
-                    val pad = (personW * 0.15f).toInt()  // 15% padding
-                    val rectLeft = (pMinX - pad).coerceAtLeast(0)
-                    val rectTop = (pMinY - pad).coerceAtLeast(0)
-                    val rectRight = (pMaxX + pad).coerceAtMost(originalBitmap.width)
-                    val rectBottom = (pMaxY + pad).coerceAtMost(originalBitmap.height)
-
-                    Log.i("InpaintScreen", "Pose: rect mask ($rectLeft,$rectTop)-($rectRight,$rectBottom)")
-
-                    resultMask = Bitmap.createBitmap(originalBitmap.width, originalBitmap.height, Bitmap.Config.ARGB_8888)
-                    val maskCanvas = Canvas(resultMask)
-                    val paint = Paint().apply {
-                        color = Color.WHITE
-                        style = Paint.Style.FILL
-                    }
-                    maskCanvas.drawRect(
-                        rectLeft.toFloat(), rectTop.toFloat(),
-                        rectRight.toFloat(), rectBottom.toFloat(),
-                        paint
-                    )
-                } else {
-                    // ── Regular edit: Use SAM for precise masking ──
-                    samLoadingMessage = "Targeting ${region.label}..."
-                    val targetX = pMinX + personW * region.relativeX
-                    val targetY = pMinY + personH * region.relativeY
-
-                    val negativePoints = region.negativeOffsets.map { (nx, ny) ->
-                        Pair(pMinX + personW * nx, pMinY + personH * ny)
-                    }
-                    val positivePoints = listOf(Pair(targetX, targetY))
-
-                    Log.i("InpaintScreen", "Pass 2: Targeting '${region.label}' at ($targetX, $targetY), ${negativePoints.size} negatives")
-
-                    val samMask = if (negativePoints.isNotEmpty()) {
-                        withContext(Dispatchers.Default) {
-                            samSegmenter.segmentPrecise(originalBitmap, positivePoints, negativePoints)
-                        }
+                    if (onSmartEdit != null) {
+                        onSmartEdit.invoke(
+                            base64String,
+                            processed.inpaintPrompt,
+                            processed.negativePrompt,
+                            processed.denoiseStrength,
+                            processed.cfgScale
+                        )
                     } else {
-                        withContext(Dispatchers.Default) {
-                            samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
-                        }
+                        onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
                     }
-
-                    if (samMask == null) {
-                        samLoadingMessage = "Could not find ${region.label}"
-                        kotlinx.coroutines.delay(2000)
-                        return@launch
-                    }
-                    resultMask = samMask
-                }
-
-                Log.i("InpaintScreen", "Pass 2: SAM mask ${resultMask.width}x${resultMask.height}")
-
-                // Apply final mask
-                val finalMaskCanvas = Canvas(maskBitmap)
-                finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                finalMaskCanvas.drawBitmap(resultMask, 0f, 0f, null)
-                updateDisplayMask()
-
-                // Encode mask to base64
-                val base64String = withContext(Dispatchers.Default) {
-                    val byteArrayOutputStream = ByteArrayOutputStream()
-                    maskBitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
-                    val byteArray = byteArrayOutputStream.toByteArray()
-                    Base64.getEncoder().encodeToString(byteArray)
-                }
-
-                if (onSmartEdit != null) {
-                    onSmartEdit.invoke(
-                        base64String,
-                        processed.inpaintPrompt,
-                        processed.negativePrompt,
-                        processed.denoiseStrength,
-                        processed.cfgScale
-                    )
                 } else {
-                    onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
+                    Log.w("InpaintScreen", "SAM auto-mask returned null. Try manual selection.")
+                    samLoadingMessage = "Could not find target. Try tapping manually."
+                    kotlinx.coroutines.delay(2000)
                 }
             } catch (e: Exception) {
                 Log.e("InpaintScreen", "Smart Edit error: ${e.message}", e)

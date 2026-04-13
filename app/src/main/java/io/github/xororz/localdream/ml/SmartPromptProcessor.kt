@@ -31,79 +31,29 @@ object SmartPromptProcessor {
         ADDITION,
         REPLACEMENT,
         ENHANCEMENT,
-        POSE_CHANGE,
         GENERAL
     }
 
     /**
      * Target region with estimated relative position in image (0.0 to 1.0).
      * For portrait-oriented images with a centered person.
-     * negativeOffsets: relative offsets from the target to place negative (exclusion) points.
      */
     enum class TargetRegion(
         val relativeX: Float, val relativeY: Float,
-        val label: String,
-        val negativeOffsets: List<Pair<Float, Float>> = emptyList()
+        val label: String
     ) {
-        EYES(0.5f, 0.28f, "eyes", listOf(
-            Pair(0.5f, 0.12f),   // forehead
-            Pair(0.5f, 0.42f),   // mouth
-            Pair(0.5f, 0.55f),   // neck/chest
-            Pair(0.25f, 0.28f),  // left of face
-            Pair(0.75f, 0.28f)   // right of face
-        )),
-        NOSE(0.5f, 0.35f, "nose", listOf(
-            Pair(0.5f, 0.12f),   // forehead
-            Pair(0.5f, 0.45f),   // mouth
-            Pair(0.5f, 0.22f),   // eyes area
-            Pair(0.35f, 0.35f),  // cheek left
-            Pair(0.65f, 0.35f)   // cheek right
-        )),
-        MOUTH(0.5f, 0.42f, "mouth", listOf(
-            Pair(0.5f, 0.28f),   // eyes
-            Pair(0.5f, 0.12f),   // forehead
-            Pair(0.5f, 0.55f),   // neck
-            Pair(0.35f, 0.42f),  // cheek left
-            Pair(0.65f, 0.42f)   // cheek right
-        )),
-        FACE(0.5f, 0.30f, "face", listOf(
-            Pair(0.5f, 0.55f),   // neck/chest
-            Pair(0.5f, 0.08f),   // top of hair
-            Pair(0.15f, 0.30f),  // background left
-            Pair(0.85f, 0.30f)   // background right
-        )),
-        HAIR(0.5f, 0.12f, "hair", listOf(
-            Pair(0.5f, 0.30f),   // face
-            Pair(0.5f, 0.50f),   // body
-            Pair(0.15f, 0.12f),  // background left
-            Pair(0.85f, 0.12f)   // background right
-        )),
+        EYES(0.5f, 0.28f, "eyes"),
+        NOSE(0.5f, 0.35f, "nose"),
+        MOUTH(0.5f, 0.42f, "mouth"),
+        FACE(0.5f, 0.30f, "face"),
+        HAIR(0.5f, 0.12f, "hair"),
         EARS(0.5f, 0.30f, "ears"),
-        NECK(0.5f, 0.48f, "neck", listOf(
-            Pair(0.5f, 0.30f),   // face
-            Pair(0.5f, 0.62f)    // shirt
-        )),
-        SHIRT(0.5f, 0.62f, "upper body", listOf(
-            Pair(0.5f, 0.30f),   // face
-            Pair(0.5f, 0.82f),   // pants
-            Pair(0.1f, 0.62f),   // background
-            Pair(0.9f, 0.62f)    // background
-        )),
-        CHEST(0.5f, 0.58f, "chest", listOf(
-            Pair(0.5f, 0.30f),   // face
-            Pair(0.5f, 0.78f)    // pants
-        )),
-        PANTS(0.5f, 0.78f, "lower body", listOf(
-            Pair(0.5f, 0.55f),   // shirt
-            Pair(0.5f, 0.95f)    // shoes
-        )),
-        SKIRT(0.5f, 0.75f, "skirt", listOf(
-            Pair(0.5f, 0.55f),
-            Pair(0.5f, 0.93f)
-        )),
-        SHOES(0.5f, 0.93f, "feet", listOf(
-            Pair(0.5f, 0.78f)    // pants
-        )),
+        NECK(0.5f, 0.48f, "neck"),
+        SHIRT(0.5f, 0.62f, "upper body"),
+        CHEST(0.5f, 0.58f, "chest"),
+        PANTS(0.5f, 0.78f, "lower body"),
+        SKIRT(0.5f, 0.75f, "skirt"),
+        SHOES(0.5f, 0.93f, "feet"),
         HANDS(0.35f, 0.60f, "hands"),
         FULL_BODY(0.5f, 0.50f, "full body"),
         BACKGROUND(0.1f, 0.1f, "background"),
@@ -172,17 +122,6 @@ object SmartPromptProcessor {
     private val enhanceActions = listOf("improve", "enhance", "beautify", "fix", "refine", "sharpen")
     private val replaceActions = listOf("replace", "swap", "substitute")
     private val undressActions = listOf("undress", "naked", "nude", "topless", "bare", "strip")
-    private val poseKeywords = listOf(
-        "pose", "position", "posing", "bent", "bend", "bending", "bentover", "bent over",
-        "sitting", "sit", "seated", "stand", "standing", "kneel", "kneeling",
-        "lying", "lay", "laying", "crouch", "crouching", "squat", "squatting",
-        "lean", "leaning", "raise", "raising", "spread", "spreading",
-        "crawl", "crawling", "jump", "jumping", "run", "running",
-        "walk", "walking", "dance", "dancing", "stretch", "stretching",
-        "arch", "arching", "twist", "twisting", "turn around",
-        "on all fours", "doggy", "from behind", "on her knees",
-        "on his knees", "hands and knees", "face down", "on back"
-    )
 
     fun process(userInstruction: String): ProcessedPrompt {
         val instruction = userInstruction.trim().lowercase()
@@ -196,15 +135,14 @@ object SmartPromptProcessor {
         val (prompt, negative) = buildOptimizedPrompt(instruction, editType, targetKeywords, targetColor, subject)
 
         val denoise = when (editType) {
-            EditType.COLOR_CHANGE -> 0.55f
-            EditType.ENHANCEMENT -> 0.45f
-            EditType.STYLE_CHANGE -> 0.60f
-            EditType.CLOTHING_CHANGE -> 0.70f
+            EditType.COLOR_CHANGE -> 0.40f
+            EditType.ENHANCEMENT -> 0.35f
+            EditType.STYLE_CHANGE -> 0.55f
+            EditType.CLOTHING_CHANGE -> 0.65f
             EditType.REMOVAL -> 0.75f
             EditType.ADDITION -> 0.70f
-            EditType.REPLACEMENT -> 0.75f
-            EditType.POSE_CHANGE -> 0.90f
-            EditType.GENERAL -> 0.60f
+            EditType.REPLACEMENT -> 0.70f
+            EditType.GENERAL -> 0.55f
         }
 
         val cfg = when (editType) {
@@ -215,7 +153,6 @@ object SmartPromptProcessor {
             EditType.REMOVAL -> 8.5f
             EditType.ADDITION -> 8.0f
             EditType.REPLACEMENT -> 8.0f
-            EditType.POSE_CHANGE -> 9.0f
             EditType.GENERAL -> 7.5f
         }
 
@@ -235,9 +172,6 @@ object SmartPromptProcessor {
      * Returns a TargetRegion with estimated relative (x, y) position.
      */
     private fun detectTargetRegion(instruction: String): TargetRegion {
-        // Pose changes always need full body
-        if (poseKeywords.any { instruction.contains(it) }) return TargetRegion.FULL_BODY
-
         // Check body parts first (more specific)
         for ((keyword, region) in bodyPartToRegion) {
             if (instruction.contains(keyword)) return region
@@ -255,9 +189,6 @@ object SmartPromptProcessor {
 
     private fun detectEditType(instruction: String): EditType {
         if (undressActions.any { instruction.contains(it) }) return EditType.CLOTHING_CHANGE
-
-        // Pose/position changes need high denoise + full body mask
-        if (poseKeywords.any { instruction.contains(it) }) return EditType.POSE_CHANGE
 
         val hasColor = colors.any { instruction.contains(it) }
         val hasColorAction = changeActions.any { instruction.contains(it) }
@@ -380,20 +311,6 @@ object SmartPromptProcessor {
             EditType.STYLE_CHANGE -> {
                 promptParts.add(extractDesiredDescription(instruction))
                 promptParts.addAll(listOf("artistic", "detailed", "high quality"))
-            }
-            EditType.POSE_CHANGE -> {
-                val desired = extractDesiredDescription(instruction)
-                promptParts.add("1girl")
-                promptParts.add(desired)
-                promptParts.addAll(listOf(
-                    "full body", "detailed anatomy", "correct proportions",
-                    "high quality", "sharp focus", "photorealistic",
-                    "detailed skin", "natural lighting"
-                ))
-                negativeParts.addAll(listOf(
-                    "extra limbs", "missing limbs", "extra arms", "extra legs",
-                    "fused fingers", "bad hands", "bad proportions"
-                ))
             }
             EditType.GENERAL -> {
                 promptParts.add(extractDesiredDescription(instruction))

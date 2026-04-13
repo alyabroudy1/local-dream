@@ -2910,9 +2910,13 @@ fun ModelRunScreen(
                     }
                 },
                 onFaceSwapResult = { swappedBitmap ->
-                    // Face swap completed - display the result
+                    // Face swap completed - display result directly (no SD generation needed)
                     showInpaintScreen = false
                     currentBitmap = swappedBitmap
+                    croppedBitmap = swappedBitmap
+                    // Clear inpaint mode so it doesn't try to run SD
+                    isInpaintMode = false
+                    Toast.makeText(context, "Face swap applied!", Toast.LENGTH_SHORT).show()
                     Log.i("ModelRunScreen", "Face swap result: ${swappedBitmap.width}x${swappedBitmap.height}")
                 },
                 onCancel = {

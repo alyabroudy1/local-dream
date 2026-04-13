@@ -456,43 +456,90 @@ fun InpaintScreen(
         if (smartEditText.isBlank()) return
         val processed = SmartPromptProcessor.process(smartEditText)
         processedPrompt = processed
-        Log.i("InpaintScreen", "Smart Edit: '${smartEditText}' → target=${processed.targetRegion.label} at (${processed.targetRegion.relativeX}, ${processed.targetRegion.relativeY}), prompt='${processed.inpaintPrompt}', denoise=${processed.denoiseStrength}")
+        Log.i("InpaintScreen", "Smart Edit: '${smartEditText}' → target=${processed.targetRegion.label}, prompt='${processed.inpaintPrompt}', denoise=${processed.denoiseStrength}")
 
         coroutineScope.launch {
             isLoading = true
             isSamProcessing = true
             samLoadingMessage = "Finding ${processed.targetRegion.label}..."
             try {
-                // Build positive and negative points from region estimation
                 val region = processed.targetRegion
                 val w = originalBitmap.width.toFloat()
                 val h = originalBitmap.height.toFloat()
 
-                val positivePoints = listOf(Pair(w * region.relativeX, h * region.relativeY))
-                val negativePoints = region.negativeOffsets.map { (nx, ny) ->
-                    Pair(w * nx, h * ny)
+                // ── PASS 1: Find the main person/subject ──
+                samLoadingMessage = "Finding subject..."
+                Log.i("InpaintScreen", "Pass 1: Finding main subject at center (${w/2}, ${h/2})")
+                val personMask = withContext(Dispatchers.Default) {
+                    samSegmenter.segmentAtPoint(originalBitmap, w / 2f, h / 2f)
                 }
 
-                Log.i("InpaintScreen", "Auto-targeting '${region.label}': " +
-                    "pos=(${positivePoints[0].first}, ${positivePoints[0].second}), " +
-                    "${negativePoints.size} negative points")
+                if (personMask == null) {
+                    Log.w("InpaintScreen", "Pass 1 failed: no subject found")
+                    samLoadingMessage = "Could not find subject"
+                    kotlinx.coroutines.delay(2000)
+                    return@launch
+                }
 
-                // Run SAM with positive + negative points for precise masking
+                // Calculate the person's bounding box from the mask
+                var minX = personMask.width; var minY = personMask.height
+                var maxX = 0; var maxY = 0
+                for (py in 0 until personMask.height) {
+                    for (px in 0 until personMask.width) {
+                        if (personMask.getPixel(px, py) != Color.TRANSPARENT) {
+                            if (px < minX) minX = px; if (px > maxX) maxX = px
+                            if (py < minY) minY = py; if (py > maxY) maxY = py
+                        }
+                    }
+                }
+                val bboxW = (maxX - minX).toFloat()
+                val bboxH = (maxY - minY).toFloat()
+                Log.i("InpaintScreen", "Pass 1: Person bbox = ($minX, $minY) - ($maxX, $maxY), size=${bboxW}x${bboxH}")
+
+                if (bboxW < 10 || bboxH < 10) {
+                    Log.w("InpaintScreen", "Pass 1: Person bbox too small")
+                    samLoadingMessage = "Subject too small to detect"
+                    kotlinx.coroutines.delay(2000)
+                    return@launch
+                }
+
+                // ── PASS 2: Target body part WITHIN the person's bbox ──
+                samLoadingMessage = "Targeting ${region.label}..."
+
+                // Calculate absolute target position based on person bbox + region offsets
+                val targetX = minX + bboxW * region.relativeX
+                val targetY = minY + bboxH * region.relativeY
+
+                // Calculate negative points within person bbox
+                val negativePoints = region.negativeOffsets.map { (nx, ny) ->
+                    Pair(minX + bboxW * nx, minY + bboxH * ny)
+                }
+                val positivePoints = listOf(Pair(targetX, targetY))
+
+                Log.i("InpaintScreen", "Pass 2: Targeting '${region.label}' at ($targetX, $targetY), ${negativePoints.size} negatives")
+
                 val samMask = if (negativePoints.isNotEmpty()) {
                     withContext(Dispatchers.Default) {
                         samSegmenter.segmentPrecise(originalBitmap, positivePoints, negativePoints)
                     }
                 } else {
-                    // Fallback to single-point for regions without negatives
                     withContext(Dispatchers.Default) {
-                        samSegmenter.segmentAtPoint(originalBitmap, positivePoints[0].first, positivePoints[0].second)
+                        samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
                     }
                 }
 
                 if (samMask != null) {
-                    Log.i("InpaintScreen", "SAM auto-mask succeeded: ${samMask.width}x${samMask.height}")
+                    // Count mask pixels for logging
+                    var maskPixels = 0
+                    for (py in 0 until samMask.height) {
+                        for (px in 0 until samMask.width) {
+                            if (samMask.getPixel(px, py) != Color.TRANSPARENT) maskPixels++
+                        }
+                    }
+                    val maskPct = maskPixels * 100f / (samMask.width * samMask.height)
+                    Log.i("InpaintScreen", "Pass 2: SAM mask = ${maskPixels}px (${String.format("%.1f", maskPct)}% of image)")
 
-                    // Apply mask to maskBitmap
+                    // Apply mask
                     val finalMaskCanvas = Canvas(maskBitmap)
                     finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
                     finalMaskCanvas.drawBitmap(samMask, 0f, 0f, null)
@@ -518,8 +565,8 @@ fun InpaintScreen(
                         onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
                     }
                 } else {
-                    Log.w("InpaintScreen", "SAM auto-mask returned null. Try manual selection.")
-                    samLoadingMessage = "Could not find target. Try tapping manually."
+                    Log.w("InpaintScreen", "Pass 2: SAM mask returned null")
+                    samLoadingMessage = "Could not find ${region.label}. Try manually."
                     kotlinx.coroutines.delay(2000)
                 }
             } catch (e: Exception) {

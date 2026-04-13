@@ -2874,6 +2874,32 @@ fun ModelRunScreen(
                 onInpaintComplete = { maskBase64, originalBitmap, maskBitmap, pathHistory ->
                     handleInpaintComplete(maskBase64, maskBitmap, pathHistory)
                 },
+                onSmartEdit = { maskBase64, smartPrompt, smartNegPrompt, smartDenoise, smartCfg ->
+                    // Set the prompt and params from SmartPromptProcessor
+                    prompt = smartPrompt
+                    negativePrompt = smartNegPrompt
+                    denoiseStrength = smartDenoise
+                    cfg = smartCfg
+
+                    // Save the mask and trigger inpaint mode
+                    showInpaintScreen = false
+                    isInpaintMode = true
+
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            val maskFile = File(context.filesDir, "mask.txt")
+                            maskFile.writeText(maskBase64)
+                            withContext(Dispatchers.Main) {
+                                base64EncodeDone = true
+                                Log.i("ModelRunScreen", "Smart Edit ready: prompt='$smartPrompt', denoise=$smartDenoise")
+                            }
+                        } catch (e: Exception) {
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(context, "Smart Edit failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    }
+                },
                 onCancel = {
                     showInpaintScreen = false
                 }

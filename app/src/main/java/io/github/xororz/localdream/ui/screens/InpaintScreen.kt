@@ -58,6 +58,9 @@ import io.github.xororz.localdream.ml.SegmentedObject
 import androidx.core.content.edit
 import androidx.compose.ui.draw.clipToBounds
 import androidx.core.graphics.createBitmap
+import io.github.xororz.localdream.ml.SmartPromptProcessor
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -84,6 +87,7 @@ fun InpaintScreen(
     existingMaskBitmap: Bitmap? = null,
     existingPathHistory: List<PathData>? = null,
     onInpaintComplete: (String, Bitmap, Bitmap, List<PathData>) -> Unit,
+    onSmartEdit: ((maskBase64: String, prompt: String, negPrompt: String, denoise: Float, cfg: Float) -> Unit)? = null,
     onCancel: () -> Unit
 ) {
     val coroutineScope = rememberCoroutineScope()
@@ -114,6 +118,8 @@ fun InpaintScreen(
     var scanProgress by remember { mutableStateOf("") }
     var detectedObjects by remember { mutableStateOf<List<SegmentedObject>>(emptyList()) }
     val selectedObjectIds = remember { mutableStateListOf<Int>() }
+    var smartEditText by remember { mutableStateOf("") }
+    var processedPrompt by remember { mutableStateOf<SmartPromptProcessor.ProcessedPrompt?>(null) }
 
     // Load SAM model in background on first compose
     LaunchedEffect(Unit) {
@@ -444,6 +450,61 @@ fun InpaintScreen(
         )
         redoStack.clear()
         updateDisplayMask()
+    }
+
+    fun processSmartEdit() {
+        if (smartEditText.isBlank()) return
+        val processed = SmartPromptProcessor.process(smartEditText)
+        processedPrompt = processed
+        Log.i("InpaintScreen", "Smart Edit: '${smartEditText}' → prompt='${processed.inpaintPrompt}', denoise=${processed.denoiseStrength}")
+
+        coroutineScope.launch {
+            isLoading = true
+            try {
+                // Build the mask from selected objects
+                val finalMaskCanvas = Canvas(maskBitmap)
+                finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+
+                for (selId in selectedObjectIds) {
+                    val selObj = detectedObjects.find { it.id == selId } ?: continue
+                    if (selObj.mask != null && !selObj.mask.isRecycled) {
+                        val srcW = min(selObj.mask.width, originalBitmap.width)
+                        val srcH = min(selObj.mask.height, originalBitmap.height)
+                        finalMaskCanvas.drawBitmap(
+                            selObj.mask,
+                            android.graphics.Rect(0, 0, srcW, srcH),
+                            android.graphics.Rect(0, 0, originalBitmap.width, originalBitmap.height),
+                            null
+                        )
+                    }
+                }
+
+                // Encode mask to base64
+                val base64String = withContext(Dispatchers.Default) {
+                    val byteArrayOutputStream = ByteArrayOutputStream()
+                    maskBitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
+                    val byteArray = byteArrayOutputStream.toByteArray()
+                    Base64.getEncoder().encodeToString(byteArray)
+                }
+
+                if (onSmartEdit != null) {
+                    onSmartEdit.invoke(
+                        base64String,
+                        processed.inpaintPrompt,
+                        processed.negativePrompt,
+                        processed.denoiseStrength,
+                        processed.cfgScale
+                    )
+                } else {
+                    // Fallback: use normal inpaint complete
+                    onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
+                }
+            } catch (e: Exception) {
+                Log.e("InpaintScreen", "Smart Edit error: ${e.message}", e)
+            } finally {
+                isLoading = false
+            }
+        }
     }
 
     fun processMask() {
@@ -1155,6 +1216,63 @@ fun InpaintScreen(
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        // Smart Edit prompt input (only in AUTO_DETECT mode with objects)
+                        if (currentToolMode == ToolMode.AUTO_DETECT && detectedObjects.isNotEmpty()) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                OutlinedTextField(
+                                    value = smartEditText,
+                                    onValueChange = { smartEditText = it },
+                                    modifier = Modifier.weight(1f),
+                                    placeholder = {
+                                        Text(
+                                            "e.g. change her eyes to red",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontSize = 11.sp
+                                        )
+                                    },
+                                    textStyle = MaterialTheme.typography.bodySmall.copy(fontSize = 13.sp),
+                                    singleLine = true,
+                                    shape = RoundedCornerShape(12.dp),
+                                    colors = OutlinedTextFieldDefaults.colors(
+                                        focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                        unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
+                                    )
+                                )
+                                Button(
+                                    onClick = { processSmartEdit() },
+                                    enabled = selectedObjectIds.isNotEmpty() && smartEditText.isNotBlank() && !isLoading,
+                                    shape = RoundedCornerShape(12.dp),
+                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                                ) {
+                                    Icon(
+                                        Icons.Default.AutoFixHigh,
+                                        contentDescription = "Apply Smart Edit",
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text("Edit", fontSize = 13.sp)
+                                }
+                            }
+
+                            // Show processed prompt preview
+                            if (processedPrompt != null) {
+                                Text(
+                                    "→ ${processedPrompt!!.inpaintPrompt}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                                    fontSize = 10.sp,
+                                    maxLines = 2,
+                                    modifier = Modifier.padding(top = 4.dp, start = 4.dp)
+                                )
                             }
                         }
 

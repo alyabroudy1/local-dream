@@ -80,6 +80,11 @@ data class PathData(
     val color: Int = Color.WHITE
 )
 
+private data class FacialMaskRect(
+    val centerXPct: Float, val centerYPct: Float,
+    val widthPct: Float, val heightPct: Float
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun InpaintScreen(
@@ -452,6 +457,23 @@ fun InpaintScreen(
         updateDisplayMask()
     }
 
+    // Small facial features that SAM can't isolate - use synthetic masks instead
+    val syntheticMaskRegions = setOf(
+        SmartPromptProcessor.TargetRegion.EYES,
+        SmartPromptProcessor.TargetRegion.NOSE,
+        SmartPromptProcessor.TargetRegion.MOUTH,
+        SmartPromptProcessor.TargetRegion.EARS
+    )
+
+    // Synthetic mask proportions relative to face bbox
+    // (centerX%, centerY%, width%, height%) - all relative to face bounding box
+    val facialFeatureProportions = mapOf(
+        SmartPromptProcessor.TargetRegion.EYES to FacialMaskRect(0.5f, 0.38f, 0.75f, 0.15f),
+        SmartPromptProcessor.TargetRegion.NOSE to FacialMaskRect(0.5f, 0.58f, 0.25f, 0.20f),
+        SmartPromptProcessor.TargetRegion.MOUTH to FacialMaskRect(0.5f, 0.75f, 0.45f, 0.15f),
+        SmartPromptProcessor.TargetRegion.EARS to FacialMaskRect(0.5f, 0.42f, 0.95f, 0.18f)
+    )
+
     fun processSmartEdit() {
         if (smartEditText.isBlank()) return
         val processed = SmartPromptProcessor.process(smartEditText)
@@ -466,108 +488,181 @@ fun InpaintScreen(
                 val region = processed.targetRegion
                 val w = originalBitmap.width.toFloat()
                 val h = originalBitmap.height.toFloat()
+                val isFacialFeature = region in syntheticMaskRegions
 
                 // ── PASS 1: Find the main person/subject ──
                 samLoadingMessage = "Finding subject..."
-                Log.i("InpaintScreen", "Pass 1: Finding main subject at center (${w/2}, ${h/2})")
+                Log.i("InpaintScreen", "Pass 1: Finding main subject at center")
                 val personMask = withContext(Dispatchers.Default) {
                     samSegmenter.segmentAtPoint(originalBitmap, w / 2f, h / 2f)
                 }
 
                 if (personMask == null) {
-                    Log.w("InpaintScreen", "Pass 1 failed: no subject found")
+                    Log.w("InpaintScreen", "Pass 1 failed")
                     samLoadingMessage = "Could not find subject"
                     kotlinx.coroutines.delay(2000)
                     return@launch
                 }
 
-                // Calculate the person's bounding box from the mask
-                var minX = personMask.width; var minY = personMask.height
-                var maxX = 0; var maxY = 0
+                // Calculate person bounding box
+                var pMinX = personMask.width; var pMinY = personMask.height
+                var pMaxX = 0; var pMaxY = 0
                 for (py in 0 until personMask.height) {
                     for (px in 0 until personMask.width) {
                         if (personMask.getPixel(px, py) != Color.TRANSPARENT) {
-                            if (px < minX) minX = px; if (px > maxX) maxX = px
-                            if (py < minY) minY = py; if (py > maxY) maxY = py
+                            if (px < pMinX) pMinX = px; if (px > pMaxX) pMaxX = px
+                            if (py < pMinY) pMinY = py; if (py > pMaxY) pMaxY = py
                         }
                     }
                 }
-                val bboxW = (maxX - minX).toFloat()
-                val bboxH = (maxY - minY).toFloat()
-                Log.i("InpaintScreen", "Pass 1: Person bbox = ($minX, $minY) - ($maxX, $maxY), size=${bboxW}x${bboxH}")
+                val personW = (pMaxX - pMinX).toFloat()
+                val personH = (pMaxY - pMinY).toFloat()
+                Log.i("InpaintScreen", "Pass 1: Person bbox ($pMinX,$pMinY)-($pMaxX,$pMaxY) ${personW}x${personH}")
 
-                if (bboxW < 10 || bboxH < 10) {
-                    Log.w("InpaintScreen", "Pass 1: Person bbox too small")
-                    samLoadingMessage = "Subject too small to detect"
+                if (personW < 10 || personH < 10) {
+                    samLoadingMessage = "Subject too small"
                     kotlinx.coroutines.delay(2000)
                     return@launch
                 }
 
-                // ── PASS 2: Target body part WITHIN the person's bbox ──
-                samLoadingMessage = "Targeting ${region.label}..."
+                val resultMask: Bitmap
 
-                // Calculate absolute target position based on person bbox + region offsets
-                val targetX = minX + bboxW * region.relativeX
-                val targetY = minY + bboxH * region.relativeY
+                if (isFacialFeature) {
+                    // ── PASS 2: Find the FACE within the person ──
+                    samLoadingMessage = "Finding face..."
+                    // Estimate face position: top 30% of person, centered
+                    val facePointX = pMinX + personW * 0.5f
+                    val facePointY = pMinY + personH * 0.18f  // upper portion
 
-                // Calculate negative points within person bbox
-                val negativePoints = region.negativeOffsets.map { (nx, ny) ->
-                    Pair(minX + bboxW * nx, minY + bboxH * ny)
-                }
-                val positivePoints = listOf(Pair(targetX, targetY))
+                    Log.i("InpaintScreen", "Pass 2: Finding face at ($facePointX, $facePointY)")
 
-                Log.i("InpaintScreen", "Pass 2: Targeting '${region.label}' at ($targetX, $targetY), ${negativePoints.size} negatives")
+                    // Use SAM with negatives to isolate face from body
+                    val facePositive = listOf(Pair(facePointX, facePointY))
+                    val faceNegative = listOf(
+                        Pair(pMinX + personW * 0.5f, pMinY + personH * 0.55f),  // chest
+                        Pair(pMinX + personW * 0.5f, pMinY + personH * 0.75f),  // waist
+                        Pair(pMinX + personW * 0.15f, pMinY + personH * 0.45f), // left arm
+                        Pair(pMinX + personW * 0.85f, pMinY + personH * 0.45f)  // right arm
+                    )
 
-                val samMask = if (negativePoints.isNotEmpty()) {
-                    withContext(Dispatchers.Default) {
-                        samSegmenter.segmentPrecise(originalBitmap, positivePoints, negativePoints)
+                    val faceMask = withContext(Dispatchers.Default) {
+                        samSegmenter.segmentPrecise(originalBitmap, facePositive, faceNegative)
                     }
-                } else {
-                    withContext(Dispatchers.Default) {
-                        samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
-                    }
-                }
 
-                if (samMask != null) {
-                    // Count mask pixels for logging
-                    var maskPixels = 0
-                    for (py in 0 until samMask.height) {
-                        for (px in 0 until samMask.width) {
-                            if (samMask.getPixel(px, py) != Color.TRANSPARENT) maskPixels++
+                    if (faceMask == null) {
+                        Log.w("InpaintScreen", "Pass 2: Face detection failed")
+                        samLoadingMessage = "Could not find face"
+                        kotlinx.coroutines.delay(2000)
+                        return@launch
+                    }
+
+                    // Get face bounding box
+                    var fMinX = faceMask.width; var fMinY = faceMask.height
+                    var fMaxX = 0; var fMaxY = 0
+                    for (py in 0 until faceMask.height) {
+                        for (px in 0 until faceMask.width) {
+                            if (faceMask.getPixel(px, py) != Color.TRANSPARENT) {
+                                if (px < fMinX) fMinX = px; if (px > fMaxX) fMaxX = px
+                                if (py < fMinY) fMinY = py; if (py > fMaxY) fMaxY = py
+                            }
                         }
                     }
-                    val maskPct = maskPixels * 100f / (samMask.width * samMask.height)
-                    Log.i("InpaintScreen", "Pass 2: SAM mask = ${maskPixels}px (${String.format("%.1f", maskPct)}% of image)")
+                    val faceW = (fMaxX - fMinX).toFloat()
+                    val faceH = (fMaxY - fMinY).toFloat()
+                    Log.i("InpaintScreen", "Pass 2: Face bbox ($fMinX,$fMinY)-($fMaxX,$fMaxY) ${faceW}x${faceH}")
 
-                    // Apply mask
-                    val finalMaskCanvas = Canvas(maskBitmap)
-                    finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                    finalMaskCanvas.drawBitmap(samMask, 0f, 0f, null)
-                    updateDisplayMask()
-
-                    // Encode mask to base64
-                    val base64String = withContext(Dispatchers.Default) {
-                        val byteArrayOutputStream = ByteArrayOutputStream()
-                        maskBitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
-                        val byteArray = byteArrayOutputStream.toByteArray()
-                        Base64.getEncoder().encodeToString(byteArray)
+                    // ── PASS 3: Create synthetic elliptical mask for the specific feature ──
+                    samLoadingMessage = "Masking ${region.label}..."
+                    val props = facialFeatureProportions[region]
+                    if (props == null || faceW < 5 || faceH < 5) {
+                        samLoadingMessage = "Cannot target ${region.label}"
+                        kotlinx.coroutines.delay(2000)
+                        return@launch
                     }
 
-                    if (onSmartEdit != null) {
-                        onSmartEdit.invoke(
-                            base64String,
-                            processed.inpaintPrompt,
-                            processed.negativePrompt,
-                            processed.denoiseStrength,
-                            processed.cfgScale
-                        )
-                    } else {
-                        onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
+                    // Calculate ellipse center and size in absolute pixels
+                    val cx = fMinX + faceW * props.centerXPct
+                    val cy = fMinY + faceH * props.centerYPct
+                    val rx = faceW * props.widthPct / 2f  // horizontal radius
+                    val ry = faceH * props.heightPct / 2f // vertical radius
+
+                    Log.i("InpaintScreen", "Pass 3: Synthetic ${region.label} ellipse center=($cx,$cy) radii=($rx,$ry)")
+
+                    // Draw the synthetic mask
+                    resultMask = Bitmap.createBitmap(originalBitmap.width, originalBitmap.height, Bitmap.Config.ARGB_8888)
+                    val maskCanvas = Canvas(resultMask)
+                    val paint = Paint().apply {
+                        color = Color.WHITE
+                        style = Paint.Style.FILL
+                        isAntiAlias = true
                     }
+                    val rect = android.graphics.RectF(cx - rx, cy - ry, cx + rx, cy + ry)
+                    maskCanvas.drawOval(rect, paint)
+
+                    // Count white pixels
+                    var maskPx = 0
+                    for (py in 0 until resultMask.height) {
+                        for (px in 0 until resultMask.width) {
+                            if (resultMask.getPixel(px, py) != Color.TRANSPARENT) maskPx++
+                        }
+                    }
+                    Log.i("InpaintScreen", "Pass 3: Synthetic mask = ${maskPx}px (${String.format("%.1f", maskPx * 100f / (w * h))}%)")
+
                 } else {
-                    Log.w("InpaintScreen", "Pass 2: SAM mask returned null")
-                    samLoadingMessage = "Could not find ${region.label}. Try manually."
-                    kotlinx.coroutines.delay(2000)
+                    // ── Large region: Use SAM directly (face, hair, shirt, etc.) ──
+                    samLoadingMessage = "Targeting ${region.label}..."
+                    val targetX = pMinX + personW * region.relativeX
+                    val targetY = pMinY + personH * region.relativeY
+
+                    val negativePoints = region.negativeOffsets.map { (nx, ny) ->
+                        Pair(pMinX + personW * nx, pMinY + personH * ny)
+                    }
+                    val positivePoints = listOf(Pair(targetX, targetY))
+
+                    Log.i("InpaintScreen", "SAM targeting '${region.label}' at ($targetX, $targetY)")
+
+                    val samMask = if (negativePoints.isNotEmpty()) {
+                        withContext(Dispatchers.Default) {
+                            samSegmenter.segmentPrecise(originalBitmap, positivePoints, negativePoints)
+                        }
+                    } else {
+                        withContext(Dispatchers.Default) {
+                            samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
+                        }
+                    }
+
+                    if (samMask == null) {
+                        samLoadingMessage = "Could not find ${region.label}"
+                        kotlinx.coroutines.delay(2000)
+                        return@launch
+                    }
+                    resultMask = samMask
+                }
+
+                // Apply final mask
+                val finalMaskCanvas = Canvas(maskBitmap)
+                finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                finalMaskCanvas.drawBitmap(resultMask, 0f, 0f, null)
+                updateDisplayMask()
+
+                // Encode mask to base64
+                val base64String = withContext(Dispatchers.Default) {
+                    val byteArrayOutputStream = ByteArrayOutputStream()
+                    maskBitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
+                    val byteArray = byteArrayOutputStream.toByteArray()
+                    Base64.getEncoder().encodeToString(byteArray)
+                }
+
+                if (onSmartEdit != null) {
+                    onSmartEdit.invoke(
+                        base64String,
+                        processed.inpaintPrompt,
+                        processed.negativePrompt,
+                        processed.denoiseStrength,
+                        processed.cfgScale
+                    )
+                } else {
+                    onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
                 }
             } catch (e: Exception) {
                 Log.e("InpaintScreen", "Smart Edit error: ${e.message}", e)

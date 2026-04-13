@@ -959,7 +959,7 @@ fun InpaintScreen(
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Row(
-                                modifier = Modifier.width(120.dp),
+                                modifier = Modifier.width(190.dp),
                                 horizontalArrangement = Arrangement.SpaceEvenly
                             ) {
                                 Box(

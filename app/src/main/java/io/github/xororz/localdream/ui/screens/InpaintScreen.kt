@@ -54,14 +54,20 @@ import android.content.Context
 import androidx.compose.ui.graphics.Color as ComposeColor
 import io.github.xororz.localdream.R
 import io.github.xororz.localdream.ml.MobileSAMSegmenter
+import io.github.xororz.localdream.ml.SegmentedObject
 import androidx.core.content.edit
 import androidx.compose.ui.draw.clipToBounds
 import androidx.core.graphics.createBitmap
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import kotlin.math.min
 
 enum class ToolMode {
     BRUSH,
     ERASER,
-    SMART_SELECT
+    SMART_SELECT,
+    AUTO_DETECT
 }
 
 data class PathData(
@@ -102,6 +108,12 @@ fun InpaintScreen(
     var isSamModelLoaded by remember { mutableStateOf(false) }
     var isSamProcessing by remember { mutableStateOf(false) }
     var samLoadingMessage by remember { mutableStateOf("") }
+
+    // Auto Detect state
+    var isScanning by remember { mutableStateOf(false) }
+    var scanProgress by remember { mutableStateOf("") }
+    var detectedObjects by remember { mutableStateOf<List<SegmentedObject>>(emptyList()) }
+    val selectedObjectIds = remember { mutableStateListOf<Int>() }
 
     // Load SAM model in background on first compose
     LaunchedEffect(Unit) {
@@ -273,14 +285,15 @@ fun InpaintScreen(
         }
 
         pathHistory.forEach { pathData ->
-            // SMART_SELECT masks are merged directly into maskBitmap, skip path drawing
-            if (pathData.mode == ToolMode.SMART_SELECT) return@forEach
+            // SMART_SELECT/AUTO_DETECT masks are merged into maskBitmap, skip path drawing
+            if (pathData.mode == ToolMode.SMART_SELECT || pathData.mode == ToolMode.AUTO_DETECT) return@forEach
 
             if (pathData.points.size > 1) {
                 val paint = when (pathData.mode) {
                     ToolMode.BRUSH -> brushPaint.apply { color = pathData.color }
                     ToolMode.ERASER -> eraserPaint
                     ToolMode.SMART_SELECT -> return@forEach
+                    ToolMode.AUTO_DETECT -> return@forEach
                 }
 
                 paint.strokeWidth = pathData.size
@@ -305,8 +318,9 @@ fun InpaintScreen(
                 ToolMode.BRUSH -> brushPaint
                 ToolMode.ERASER -> eraserPaint
                 ToolMode.SMART_SELECT -> null
+                ToolMode.AUTO_DETECT -> null
             }
-            if (paint == null) return // SMART_SELECT doesn't draw strokes
+            if (paint == null) return // Non-drawing modes
 
             paint.strokeWidth = convertDpToImagePixels(
                 brushSizeDpValue,
@@ -367,6 +381,71 @@ fun InpaintScreen(
         }
     }
 
+    fun scanObjects() {
+        if (!isSamModelLoaded || isScanning) return
+        coroutineScope.launch {
+            isScanning = true
+            scanProgress = "Scanning for objects..."
+            try {
+                val result = withContext(Dispatchers.Default) {
+                    samSegmenter.segmentImage(originalBitmap, 32)
+                }
+                if (result != null && result.objects.isNotEmpty()) {
+                    detectedObjects = result.objects
+                    selectedObjectIds.clear()
+                    Log.i("InpaintScreen", "Auto Detect found ${result.objects.size} objects")
+                } else {
+                    Log.w("InpaintScreen", "Auto Detect found no objects")
+                }
+            } catch (e: Exception) {
+                Log.e("InpaintScreen", "Auto Detect failed: ${e.message}", e)
+            } finally {
+                isScanning = false
+                scanProgress = ""
+            }
+        }
+    }
+
+    fun toggleObjectMask(obj: SegmentedObject) {
+        if (selectedObjectIds.contains(obj.id)) {
+            // Deselect: remove this object's mask
+            selectedObjectIds.remove(obj.id)
+        } else {
+            // Select: add this object's mask
+            selectedObjectIds.add(obj.id)
+        }
+
+        // Rebuild maskBitmap from all selected objects
+        val canvas = Canvas(maskBitmap)
+        canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+
+        for (selId in selectedObjectIds) {
+            val selObj = detectedObjects.find { it.id == selId } ?: continue
+            if (selObj.mask != null && !selObj.mask.isRecycled) {
+                val srcW = min(selObj.mask.width, originalBitmap.width)
+                val srcH = min(selObj.mask.height, originalBitmap.height)
+                canvas.drawBitmap(
+                    selObj.mask,
+                    android.graphics.Rect(0, 0, srcW, srcH),
+                    android.graphics.Rect(0, 0, originalBitmap.width, originalBitmap.height),
+                    null
+                )
+            }
+        }
+
+        // Add a PathData entry for undo support
+        pathHistory.add(
+            PathData(
+                points = emptyList(),
+                size = 0f,
+                mode = ToolMode.AUTO_DETECT,
+                color = Color.WHITE
+            )
+        )
+        redoStack.clear()
+        updateDisplayMask()
+    }
+
     fun processMask() {
         coroutineScope.launch {
             isLoading = true
@@ -380,6 +459,8 @@ fun InpaintScreen(
                 }
 
                 for (pathData in pathHistory) {
+                    // AUTO_DETECT entries are handled by maskBitmap rebuild, skip
+                    if (pathData.mode == ToolMode.AUTO_DETECT) continue
                     if (pathData.points.isEmpty()) continue
 
                     // SMART_SELECT: re-run SAM to rebuild the mask
@@ -401,6 +482,7 @@ fun InpaintScreen(
                         ToolMode.BRUSH -> finalPaint
                         ToolMode.ERASER -> eraserPaint
                         ToolMode.SMART_SELECT -> continue
+                        ToolMode.AUTO_DETECT -> continue
                     }
 
                     paint.strokeWidth = pathData.size
@@ -595,7 +677,11 @@ fun InpaintScreen(
                                 // Smart Select: single tap to segment
                                 if (currentToolMode == ToolMode.SMART_SELECT && firstImgPt != null) {
                                     handleSmartSelectTap(firstImgPt)
-                                    // Consume the gesture and skip drawing
+                                    return@awaitEachGesture
+                                }
+
+                                // Auto Detect: no drawing, just consume gesture
+                                if (currentToolMode == ToolMode.AUTO_DETECT) {
                                     return@awaitEachGesture
                                 }
 
@@ -867,10 +953,52 @@ fun InpaintScreen(
                                         )
                                     }
                                 }
+
+                                // Auto Detect (scan all objects)
+                                Box(
+                                    modifier = Modifier.size(36.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (currentToolMode == ToolMode.AUTO_DETECT) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(36.dp)
+                                                .clip(CircleShape)
+                                                .background(
+                                                    MaterialTheme.colorScheme.primary.copy(
+                                                        alpha = 0.15f
+                                                    )
+                                                )
+                                        )
+                                    }
+
+                                    IconButton(
+                                        onClick = {
+                                            currentToolMode = ToolMode.AUTO_DETECT
+                                            if (detectedObjects.isEmpty() && !isScanning) {
+                                                scanObjects()
+                                            }
+                                        },
+                                        modifier = Modifier.size(36.dp),
+                                        enabled = isSamModelLoaded && !isScanning
+                                    ) {
+                                        Icon(
+                                            Icons.Default.GridView,
+                                            contentDescription = "Auto Detect Objects",
+                                            tint = if (currentToolMode == ToolMode.AUTO_DETECT)
+                                                MaterialTheme.colorScheme.primary
+                                            else if (!isSamModelLoaded)
+                                                MaterialTheme.colorScheme.onSurface.copy(alpha = 0.3f)
+                                            else
+                                                MaterialTheme.colorScheme.onSurface,
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                    }
+                                }
                             }
 
                             // Only show slider and color when in Brush/Eraser mode
-                            if (currentToolMode != ToolMode.SMART_SELECT) {
+                            if (currentToolMode == ToolMode.BRUSH || currentToolMode == ToolMode.ERASER) {
                             Box(
                                 modifier = Modifier
                                     .weight(1f)
@@ -914,8 +1042,8 @@ fun InpaintScreen(
                                         }
                                 )
                             }
-                            } else {
-                                // Smart Select mode: show hint text instead of slider
+                            } else if (currentToolMode == ToolMode.SMART_SELECT) {
+                                // Smart Select mode: show hint text
                                 Box(
                                     modifier = Modifier
                                         .weight(1f)
@@ -929,6 +1057,103 @@ fun InpaintScreen(
                                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
                                         fontSize = 12.sp
                                     )
+                                }
+                            } else if (currentToolMode == ToolMode.AUTO_DETECT) {
+                                // Auto Detect mode: object gallery
+                                if (isScanning) {
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .padding(horizontal = 8.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            CircularProgressIndicator(
+                                                modifier = Modifier.size(16.dp),
+                                                strokeWidth = 2.dp
+                                            )
+                                            Text(
+                                                "Scanning objects...",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontSize = 12.sp
+                                            )
+                                        }
+                                    }
+                                } else if (detectedObjects.isNotEmpty()) {
+                                    LazyRow(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .padding(horizontal = 4.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                        contentPadding = PaddingValues(horizontal = 4.dp)
+                                    ) {
+                                        items(detectedObjects) { obj ->
+                                            val isSelected = selectedObjectIds.contains(obj.id)
+                                            // Crop object thumbnail from original bitmap
+                                            val thumb = remember(obj.id) {
+                                                try {
+                                                    val bx = obj.bbox.x.coerceIn(0, originalBitmap.width - 1)
+                                                    val by = obj.bbox.y.coerceIn(0, originalBitmap.height - 1)
+                                                    val bw = min(obj.bbox.width, originalBitmap.width - bx).coerceAtLeast(1)
+                                                    val bh = min(obj.bbox.height, originalBitmap.height - by).coerceAtLeast(1)
+                                                    Bitmap.createBitmap(originalBitmap, bx, by, bw, bh)
+                                                } catch (e: Exception) {
+                                                    originalBitmap
+                                                }
+                                            }
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(52.dp)
+                                                    .clip(RoundedCornerShape(8.dp))
+                                                    .border(
+                                                        width = if (isSelected) 3.dp else 1.dp,
+                                                        color = if (isSelected)
+                                                            MaterialTheme.colorScheme.primary
+                                                        else
+                                                            MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
+                                                        shape = RoundedCornerShape(8.dp)
+                                                    )
+                                                    .clickable { toggleObjectMask(obj) },
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                Image(
+                                                    bitmap = thumb.asImageBitmap(),
+                                                    contentDescription = obj.label,
+                                                    modifier = Modifier.fillMaxSize(),
+                                                    contentScale = ContentScale.Crop
+                                                )
+                                                if (isSelected) {
+                                                    Box(
+                                                        modifier = Modifier
+                                                            .fillMaxSize()
+                                                            .background(
+                                                                MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)
+                                                            )
+                                                    )
+                                                    Icon(
+                                                        Icons.Default.Check,
+                                                        contentDescription = "Selected",
+                                                        tint = ComposeColor.White,
+                                                        modifier = Modifier.size(20.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .padding(horizontal = 8.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        TextButton(onClick = { scanObjects() }) {
+                                            Text("Tap to scan objects")
+                                        }
+                                    }
                                 }
                             }
                         }

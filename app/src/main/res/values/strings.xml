@@ -257,4 +257,15 @@
     <string name="object_detected">%d objects detected</string>
     <string name="select_object_to_inpaint">Select an object to inpaint</string>
     <string name="inpaint_selected_object">Inpaint Selected Object</string>
+
+    <!-- Face Swap -->
+    <string name="face_swap">Face Swap</string>
+    <string name="select_source_face">Select Source Face</string>
+    <string name="download_face_models">Download Face Models</string>
+    <string name="face_models_desc">Download face detection and swapping models (~725MB). This only needs to be done once.</string>
+    <string name="swapping_face">Swapping face…</string>
+    <string name="face_swap_applied">Face swap applied!</string>
+    <string name="no_face_detected_source">No face detected in source image</string>
+    <string name="no_face_detected_target">No face detected in target image</string>
+    <string name="face_swap_failed">Face swap failed: %s</string>
 </resources>

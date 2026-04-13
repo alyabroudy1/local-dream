@@ -2881,6 +2881,15 @@ fun ModelRunScreen(
                     denoiseStrength = smartDenoise
                     cfg = smartCfg
 
+                    // Decode the mask base64 into a Bitmap for the generation service
+                    try {
+                        val maskBytes = java.util.Base64.getDecoder().decode(maskBase64)
+                        maskBitmap = BitmapFactory.decodeByteArray(maskBytes, 0, maskBytes.size)
+                        Log.i("ModelRunScreen", "Smart Edit mask decoded: ${maskBitmap?.width}x${maskBitmap?.height}")
+                    } catch (e: Exception) {
+                        Log.e("ModelRunScreen", "Failed to decode mask: ${e.message}")
+                    }
+
                     // Save the mask and trigger inpaint mode
                     showInpaintScreen = false
                     isInpaintMode = true
@@ -2891,7 +2900,7 @@ fun ModelRunScreen(
                             maskFile.writeText(maskBase64)
                             withContext(Dispatchers.Main) {
                                 base64EncodeDone = true
-                                Log.i("ModelRunScreen", "Smart Edit ready: prompt='$smartPrompt', denoise=$smartDenoise")
+                                Log.i("ModelRunScreen", "Smart Edit ready: prompt='$smartPrompt', denoise=$smartDenoise, hasMask=${maskBitmap != null}")
                             }
                         } catch (e: Exception) {
                             withContext(Dispatchers.Main) {

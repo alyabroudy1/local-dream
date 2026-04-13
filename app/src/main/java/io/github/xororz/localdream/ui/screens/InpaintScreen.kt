@@ -42,6 +42,7 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.compose.ui.res.stringResource
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -70,7 +71,8 @@ enum class ToolMode {
     BRUSH,
     ERASER,
     SMART_SELECT,
-    AUTO_DETECT
+    AUTO_DETECT,
+    FACE_SWAP
 }
 
 data class PathData(
@@ -88,6 +90,7 @@ fun InpaintScreen(
     existingPathHistory: List<PathData>? = null,
     onInpaintComplete: (String, Bitmap, Bitmap, List<PathData>) -> Unit,
     onSmartEdit: ((maskBase64: String, prompt: String, negPrompt: String, denoise: Float, cfg: Float) -> Unit)? = null,
+    onFaceSwapResult: ((Bitmap) -> Unit)? = null,
     onCancel: () -> Unit
 ) {
     val coroutineScope = rememberCoroutineScope()
@@ -120,6 +123,34 @@ fun InpaintScreen(
     val selectedObjectIds = remember { mutableStateListOf<Int>() }
     var smartEditText by remember { mutableStateOf("") }
     var processedPrompt by remember { mutableStateOf<SmartPromptProcessor.ProcessedPrompt?>(null) }
+
+    // Face Swap state
+    var faceSwapSourceBitmap by remember { mutableStateOf<Bitmap?>(null) }
+    var isFaceSwapProcessing by remember { mutableStateOf(false) }
+    var faceSwapStatus by remember { mutableStateOf("") }
+    val faceSwapEngine = remember { io.github.xororz.localdream.ml.FaceSwapEngine(context) }
+    val faceSwapModelManager = remember { io.github.xororz.localdream.ml.FaceSwapModelManager(context) }
+    var faceSwapModelsReady by remember { mutableStateOf(faceSwapModelManager.areModelsReady()) }
+    var isDownloadingModels by remember { mutableStateOf(false) }
+
+    // Image picker for face swap source
+    val faceSwapImagePicker = rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.GetContent()
+    ) { uri ->
+        uri?.let {
+            try {
+                val inputStream = context.contentResolver.openInputStream(it)
+                val bitmap = android.graphics.BitmapFactory.decodeStream(inputStream)
+                inputStream?.close()
+                if (bitmap != null) {
+                    faceSwapSourceBitmap = bitmap
+                    Log.i("InpaintScreen", "Face swap source loaded: ${bitmap.width}x${bitmap.height}")
+                }
+            } catch (e: Exception) {
+                Log.e("InpaintScreen", "Failed to load face swap source: ${e.message}")
+            }
+        }
+    }
 
     // Load SAM model in background on first compose
     LaunchedEffect(Unit) {
@@ -300,6 +331,7 @@ fun InpaintScreen(
                     ToolMode.ERASER -> eraserPaint
                     ToolMode.SMART_SELECT -> return@forEach
                     ToolMode.AUTO_DETECT -> return@forEach
+                    ToolMode.FACE_SWAP -> return@forEach
                 }
 
                 paint.strokeWidth = pathData.size
@@ -325,6 +357,7 @@ fun InpaintScreen(
                 ToolMode.ERASER -> eraserPaint
                 ToolMode.SMART_SELECT -> null
                 ToolMode.AUTO_DETECT -> null
+                ToolMode.FACE_SWAP -> null
             }
             if (paint == null) return // Non-drawing modes
 
@@ -560,6 +593,7 @@ fun InpaintScreen(
                         ToolMode.ERASER -> eraserPaint
                         ToolMode.SMART_SELECT -> continue
                         ToolMode.AUTO_DETECT -> continue
+                        ToolMode.FACE_SWAP -> continue
                     }
 
                     paint.strokeWidth = pathData.size
@@ -1067,6 +1101,40 @@ fun InpaintScreen(
                                         )
                                     }
                                 }
+
+                                // Face Swap button
+                                Box(
+                                    modifier = Modifier.size(36.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (currentToolMode == ToolMode.FACE_SWAP) {
+                                        Box(
+                                            modifier = Modifier
+                                                .size(36.dp)
+                                                .clip(CircleShape)
+                                                .background(
+                                                    MaterialTheme.colorScheme.tertiary.copy(
+                                                        alpha = 0.15f
+                                                    )
+                                                )
+                                        )
+                                    }
+
+                                    IconButton(
+                                        onClick = { currentToolMode = ToolMode.FACE_SWAP },
+                                        modifier = Modifier.size(36.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Default.Face,
+                                            contentDescription = "Face Swap",
+                                            tint = if (currentToolMode == ToolMode.FACE_SWAP)
+                                                MaterialTheme.colorScheme.tertiary
+                                            else
+                                                MaterialTheme.colorScheme.onSurface,
+                                            modifier = Modifier.size(22.dp)
+                                        )
+                                    }
+                                }
                             }
 
                             // Only show slider and color when in Brush/Eraser mode
@@ -1192,6 +1260,143 @@ fun InpaintScreen(
                                             maxLines = 1,
                                             modifier = Modifier.padding(top = 2.dp, start = 4.dp)
                                         )
+                                    }
+                                }
+                            } else if (currentToolMode == ToolMode.FACE_SWAP) {
+                                // Face Swap panel
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(horizontal = 4.dp)
+                                ) {
+                                    if (!faceSwapModelsReady) {
+                                        // Download models first
+                                        if (isDownloadingModels) {
+                                            val downloadState by faceSwapModelManager.downloadState.collectAsState()
+                                            when (val state = downloadState) {
+                                                is io.github.xororz.localdream.ml.FaceSwapModelManager.DownloadState.Downloading -> {
+                                                    Text(
+                                                        "Downloading ${state.modelName}... ${(state.totalProgress * 100).toInt()}%",
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        fontSize = 11.sp
+                                                    )
+                                                    LinearProgressIndicator(
+                                                        progress = { state.totalProgress },
+                                                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                                                    )
+                                                }
+                                                is io.github.xororz.localdream.ml.FaceSwapModelManager.DownloadState.Error -> {
+                                                    Text(
+                                                        "Error: ${state.message}",
+                                                        style = MaterialTheme.typography.bodySmall,
+                                                        color = MaterialTheme.colorScheme.error,
+                                                        fontSize = 11.sp
+                                                    )
+                                                }
+                                                is io.github.xororz.localdream.ml.FaceSwapModelManager.DownloadState.Complete -> {
+                                                    faceSwapModelsReady = true
+                                                    isDownloadingModels = false
+                                                }
+                                                else -> {}
+                                            }
+                                        } else {
+                                            Row(
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                            ) {
+                                                Text(
+                                                    "Face swap models needed (~725MB)",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    fontSize = 11.sp,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                Button(
+                                                    onClick = {
+                                                        isDownloadingModels = true
+                                                        coroutineScope.launch {
+                                                            faceSwapModelManager.downloadModels()
+                                                        }
+                                                    },
+                                                    shape = RoundedCornerShape(12.dp),
+                                                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                                                ) {
+                                                    Icon(Icons.Default.Download, contentDescription = "Download", modifier = Modifier.size(16.dp))
+                                                    Spacer(modifier = Modifier.width(4.dp))
+                                                    Text("Download", fontSize = 12.sp)
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        // Models ready — show swap UI
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            // Source face thumbnail / picker
+                                            Box(
+                                                modifier = Modifier
+                                                    .size(48.dp)
+                                                    .clip(RoundedCornerShape(8.dp))
+                                                    .background(MaterialTheme.colorScheme.surfaceVariant)
+                                                    .clickable { faceSwapImagePicker.launch("image/*") },
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                if (faceSwapSourceBitmap != null) {
+                                                    Image(
+                                                        bitmap = faceSwapSourceBitmap!!.asImageBitmap(),
+                                                        contentDescription = "Source face",
+                                                        modifier = Modifier.fillMaxSize(),
+                                                        contentScale = ContentScale.Crop
+                                                    )
+                                                } else {
+                                                    Icon(Icons.Default.AddAPhoto, contentDescription = "Select source face", tint = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.size(24.dp))
+                                                }
+                                            }
+
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    if (faceSwapSourceBitmap != null) "Source face loaded" else "Tap to select source face",
+                                                    style = MaterialTheme.typography.bodySmall, fontSize = 11.sp
+                                                )
+                                                if (isFaceSwapProcessing) {
+                                                    Text(faceSwapStatus, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary, fontSize = 10.sp)
+                                                }
+                                            }
+
+                                            Button(
+                                                onClick = {
+                                                    if (faceSwapSourceBitmap != null) {
+                                                        coroutineScope.launch {
+                                                            isFaceSwapProcessing = true
+                                                            faceSwapStatus = "Loading models..."
+                                                            try {
+                                                                val loaded = faceSwapEngine.loadModels()
+                                                                if (loaded) {
+                                                                    val result = faceSwapEngine.swapFaces(faceSwapSourceBitmap!!, originalBitmap) { status -> faceSwapStatus = status }
+                                                                    faceSwapEngine.release()
+                                                                    if (result != null) { onFaceSwapResult?.invoke(result) } else { faceSwapStatus = "No faces found" }
+                                                                } else { faceSwapStatus = "Failed to load models" }
+                                                            } catch (e: Exception) {
+                                                                faceSwapStatus = "Error: ${e.message}"
+                                                                Log.e("InpaintScreen", "Face swap error", e)
+                                                            } finally { isFaceSwapProcessing = false }
+                                                        }
+                                                    }
+                                                },
+                                                enabled = faceSwapSourceBitmap != null && !isFaceSwapProcessing,
+                                                shape = RoundedCornerShape(12.dp),
+                                                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                                            ) {
+                                                if (isFaceSwapProcessing) {
+                                                    CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                                } else {
+                                                    Icon(Icons.Default.SwapHoriz, contentDescription = "Swap", modifier = Modifier.size(18.dp))
+                                                }
+                                                Spacer(modifier = Modifier.width(4.dp))
+                                                Text("Swap", fontSize = 13.sp)
+                                            }
+                                        }
                                     }
                                 }
                             }

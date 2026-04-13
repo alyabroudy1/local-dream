@@ -2909,6 +2909,12 @@ fun ModelRunScreen(
                         }
                     }
                 },
+                onFaceSwapResult = { swappedBitmap ->
+                    // Face swap completed - display the result
+                    showInpaintScreen = false
+                    currentBitmap = swappedBitmap
+                    Log.i("ModelRunScreen", "Face swap result: ${swappedBitmap.width}x${swappedBitmap.height}")
+                },
                 onCancel = {
                     showInpaintScreen = false
                 }

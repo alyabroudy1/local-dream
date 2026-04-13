@@ -9,6 +9,9 @@ import ai.onnxruntime.OrtSession
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.*
 
@@ -78,6 +81,7 @@ class FaceSwapEngine(private val context: Context) {
     private var detectorSession: OrtSession? = null
     private var recognizerSession: OrtSession? = null
     private var swapperSession: OrtSession? = null
+    private var emapMatrix: FloatArray? = null // emap from inswapper model
     private var isLoaded = false
 
     /**
@@ -113,6 +117,15 @@ class FaceSwapEngine(private val context: Context) {
             Log.i(TAG, "Loading swapper model...")
             swapperSession = ortEnv!!.createSession(swapFile.absolutePath, opts)
             Log.i(TAG, "Swapper loaded. Inputs: ${swapperSession!!.inputNames}, Outputs: ${swapperSession!!.outputNames}")
+
+            // Extract emap matrix from model
+            Log.i(TAG, "Extracting emap matrix from swapper model...")
+            emapMatrix = extractEmapFromOnnx(swapFile)
+            if (emapMatrix != null) {
+                Log.i(TAG, "Emap extracted: ${emapMatrix!!.size} floats (${sqrt(emapMatrix!!.size.toFloat()).toInt()}x${sqrt(emapMatrix!!.size.toFloat()).toInt()})")
+            } else {
+                Log.w(TAG, "Failed to extract emap - face swap quality will be degraded")
+            }
 
             isLoaded = true
             Log.i(TAG, "All face swap models loaded successfully")
@@ -390,7 +403,7 @@ class FaceSwapEngine(private val context: Context) {
         val aligned = alignFace(targetImage, targetFace.landmarks, INSWAPPER_DST, 128)
             ?: return null
 
-        // Prepare target face tensor [1, 3, 128, 128]
+        // Prepare target face tensor [1, 3, 128, 128] - RGB order, [0, 1] range
         val inputSize = 128
         val inputData = FloatArray(3 * inputSize * inputSize)
         val pixels = IntArray(inputSize * inputSize)
@@ -401,19 +414,43 @@ class FaceSwapEngine(private val context: Context) {
             val r = ((pixel shr 16) and 0xFF).toFloat() / 255f
             val g = ((pixel shr 8) and 0xFF).toFloat() / 255f
             val b = (pixel and 0xFF).toFloat() / 255f
-            // BGR order
-            inputData[i] = b
+            // RGB order for inswapper
+            inputData[i] = r
             inputData[inputSize * inputSize + i] = g
-            inputData[2 * inputSize * inputSize + i] = r
+            inputData[2 * inputSize * inputSize + i] = b
         }
 
         val targetTensor = OnnxTensor.createTensor(
             ortEnv!!, FloatBuffer.wrap(inputData), longArrayOf(1, 3, inputSize.toLong(), inputSize.toLong())
         )
 
+        // Transform source embedding through emap matrix
+        val transformedEmbedding = if (emapMatrix != null) {
+            val emap = emapMatrix!!
+            val dim = sourceEmbedding.size // 512
+            val result = FloatArray(dim)
+            // Matrix multiply: result = sourceEmbedding × emap (emap is [512, 512])
+            for (j in 0 until dim) {
+                var sum = 0f
+                for (k in 0 until dim) {
+                    sum += sourceEmbedding[k] * emap[k * dim + j]
+                }
+                result[j] = sum
+            }
+            // L2 normalize the result
+            val norm = sqrt(result.sumOf { (it * it).toDouble() }).toFloat()
+            if (norm > 0) for (i in result.indices) result[i] /= norm
+            Log.i(TAG, "Embedding transformed through emap, norm=$norm")
+            result
+        } else {
+            // Fallback: use raw embedding (quality will be poor)
+            Log.w(TAG, "Using raw embedding without emap transformation")
+            sourceEmbedding
+        }
+
         // Prepare source embedding tensor [1, 512]
         val embeddingTensor = OnnxTensor.createTensor(
-            ortEnv!!, FloatBuffer.wrap(sourceEmbedding), longArrayOf(1, sourceEmbedding.size.toLong())
+            ortEnv!!, FloatBuffer.wrap(transformedEmbedding), longArrayOf(1, transformedEmbedding.size.toLong())
         )
 
         // Run swapper
@@ -435,10 +472,10 @@ class FaceSwapEngine(private val context: Context) {
         val outPixels = IntArray(inputSize * inputSize)
 
         for (i in 0 until inputSize * inputSize) {
-            // Output is BGR, [0, 1] range
-            val b = (outputData.get(i) * 255f).toInt().coerceIn(0, 255)
+            // Output is RGB, [0, 1] range
+            val r = (outputData.get(i) * 255f).toInt().coerceIn(0, 255)
             val g = (outputData.get(inputSize * inputSize + i) * 255f).toInt().coerceIn(0, 255)
-            val r = (outputData.get(2 * inputSize * inputSize + i) * 255f).toInt().coerceIn(0, 255)
+            val b = (outputData.get(2 * inputSize * inputSize + i) * 255f).toInt().coerceIn(0, 255)
             outPixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
         }
         swappedFace.setPixels(outPixels, 0, inputSize, 0, 0, inputSize, inputSize)
@@ -594,5 +631,116 @@ class FaceSwapEngine(private val context: Context) {
         val bArea = b.width() * b.height()
 
         return interArea / (aArea + bArea - interArea)
+    }
+
+    // ─── ONNX Emap Extraction ───────────────────────────────────────────
+
+    /**
+     * Extract the 'emap' (buff2fs) matrix from the inswapper ONNX model.
+     * This matrix is stored as an unused initializer in the ONNX protobuf.
+     * The source embedding must be multiplied by this matrix before feeding
+     * to the swapper model.
+     *
+     * Approach: scan the last portion of the ONNX file for the "buff2fs" tensor
+     * name, then parse the surrounding protobuf to extract the raw float data.
+     */
+    private fun extractEmapFromOnnx(modelFile: File): FloatArray? {
+        try {
+            val raf = RandomAccessFile(modelFile, "r")
+            // The emap (~1MB) is the last initializer, so read last 5MB
+            val readSize = minOf(modelFile.length(), 5L * 1024 * 1024)
+            val offset = modelFile.length() - readSize
+            raf.seek(offset)
+            val buffer = ByteArray(readSize.toInt())
+            raf.readFully(buffer)
+            raf.close()
+
+            // Search for the protobuf field: name = "buff2fs"
+            // In protobuf: field 8 (name), wire type 2 → tag byte = (8 << 3) | 2 = 0x42
+            // Then varint length 7, then "buff2fs"
+            val namePattern = byteArrayOf(
+                0x42, 0x07,
+                'b'.code.toByte(), 'u'.code.toByte(), 'f'.code.toByte(), 'f'.code.toByte(),
+                '2'.code.toByte(), 'f'.code.toByte(), 's'.code.toByte()
+            )
+
+            val namePos = findPattern(buffer, namePattern)
+            if (namePos < 0) {
+                Log.w(TAG, "Could not find 'buff2fs' in ONNX model")
+                return null
+            }
+            Log.i(TAG, "Found 'buff2fs' at position ${namePos + offset}")
+
+            // After the name field, scan for raw_data field (field 13, wire type 2)
+            // Tag = (13 << 3) | 2 = 0x6A
+            var pos = namePos + namePattern.size
+            while (pos < buffer.size - 10) {
+                val tag = buffer[pos].toInt() and 0xFF
+
+                if (tag == 0x6A) {
+                    // Found raw_data field
+                    pos++
+                    val (len, bytesRead) = readVarintFromBuffer(buffer, pos)
+                    pos += bytesRead
+
+                    if (len > 0 && len <= 512 * 512 * 4 && pos + len.toInt() <= buffer.size) {
+                        val numFloats = (len / 4).toInt()
+                        val floats = FloatArray(numFloats)
+                        val bb = ByteBuffer.wrap(buffer, pos, len.toInt())
+                        bb.order(ByteOrder.LITTLE_ENDIAN)
+                        bb.asFloatBuffer().get(floats)
+                        Log.i(TAG, "Extracted emap raw_data: $numFloats floats")
+                        return floats
+                    }
+                }
+
+                // Skip this field
+                val wireType = tag and 7
+                pos++
+                when (wireType) {
+                    0 -> { // varint
+                        while (pos < buffer.size && buffer[pos].toInt() and 0x80 != 0) pos++
+                        pos++
+                    }
+                    1 -> pos += 8 // 64-bit
+                    2 -> { // length-delimited
+                        val (len, bytesRead) = readVarintFromBuffer(buffer, pos)
+                        pos += bytesRead + len.toInt()
+                    }
+                    5 -> pos += 4 // 32-bit
+                    else -> pos++ // unknown, skip byte
+                }
+            }
+
+            Log.w(TAG, "Found buff2fs name but could not parse raw_data")
+            return null
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to extract emap: ${e.message}", e)
+            return null
+        }
+    }
+
+    private fun findPattern(data: ByteArray, pattern: ByteArray): Int {
+        outer@ for (i in 0..data.size - pattern.size) {
+            for (j in pattern.indices) {
+                if (data[i + j] != pattern[j]) continue@outer
+            }
+            return i
+        }
+        return -1
+    }
+
+    private fun readVarintFromBuffer(buffer: ByteArray, startPos: Int): Pair<Long, Int> {
+        var result = 0L
+        var shift = 0
+        var pos = startPos
+        while (pos < buffer.size) {
+            val b = buffer[pos].toInt() and 0xFF
+            result = result or ((b.toLong() and 0x7F) shl shift)
+            pos++
+            if (b and 0x80 == 0) break
+            shift += 7
+        }
+        return Pair(result, pos - startPos)
     }
 }

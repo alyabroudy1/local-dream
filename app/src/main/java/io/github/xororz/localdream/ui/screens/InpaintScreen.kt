@@ -463,14 +463,30 @@ fun InpaintScreen(
             isSamProcessing = true
             samLoadingMessage = "Finding ${processed.targetRegion.label}..."
             try {
-                // Calculate target point from region estimation
-                val targetX = (originalBitmap.width * processed.targetRegion.relativeX)
-                val targetY = (originalBitmap.height * processed.targetRegion.relativeY)
-                Log.i("InpaintScreen", "Auto-targeting point (${targetX}, ${targetY}) for '${processed.targetRegion.label}'")
+                // Build positive and negative points from region estimation
+                val region = processed.targetRegion
+                val w = originalBitmap.width.toFloat()
+                val h = originalBitmap.height.toFloat()
 
-                // Run SAM at the estimated target point
-                val samMask = withContext(Dispatchers.Default) {
-                    samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
+                val positivePoints = listOf(Pair(w * region.relativeX, h * region.relativeY))
+                val negativePoints = region.negativeOffsets.map { (nx, ny) ->
+                    Pair(w * nx, h * ny)
+                }
+
+                Log.i("InpaintScreen", "Auto-targeting '${region.label}': " +
+                    "pos=(${positivePoints[0].first}, ${positivePoints[0].second}), " +
+                    "${negativePoints.size} negative points")
+
+                // Run SAM with positive + negative points for precise masking
+                val samMask = if (negativePoints.isNotEmpty()) {
+                    withContext(Dispatchers.Default) {
+                        samSegmenter.segmentPrecise(originalBitmap, positivePoints, negativePoints)
+                    }
+                } else {
+                    // Fallback to single-point for regions without negatives
+                    withContext(Dispatchers.Default) {
+                        samSegmenter.segmentAtPoint(originalBitmap, positivePoints[0].first, positivePoints[0].second)
+                    }
                 }
 
                 if (samMask != null) {

@@ -37,23 +37,72 @@ object SmartPromptProcessor {
     /**
      * Target region with estimated relative position in image (0.0 to 1.0).
      * For portrait-oriented images with a centered person.
+     * negativeOffsets: relative offsets from the target to place negative (exclusion) points.
      */
     enum class TargetRegion(
         val relativeX: Float, val relativeY: Float,
-        val label: String
+        val label: String,
+        val negativeOffsets: List<Pair<Float, Float>> = emptyList()
     ) {
-        EYES(0.5f, 0.28f, "eyes"),
-        NOSE(0.5f, 0.35f, "nose"),
-        MOUTH(0.5f, 0.42f, "mouth"),
-        FACE(0.5f, 0.30f, "face"),
-        HAIR(0.5f, 0.12f, "hair"),
+        EYES(0.5f, 0.28f, "eyes", listOf(
+            Pair(0.5f, 0.12f),   // forehead
+            Pair(0.5f, 0.42f),   // mouth
+            Pair(0.5f, 0.55f),   // neck/chest
+            Pair(0.25f, 0.28f),  // left of face
+            Pair(0.75f, 0.28f)   // right of face
+        )),
+        NOSE(0.5f, 0.35f, "nose", listOf(
+            Pair(0.5f, 0.12f),   // forehead
+            Pair(0.5f, 0.45f),   // mouth
+            Pair(0.5f, 0.22f),   // eyes area
+            Pair(0.35f, 0.35f),  // cheek left
+            Pair(0.65f, 0.35f)   // cheek right
+        )),
+        MOUTH(0.5f, 0.42f, "mouth", listOf(
+            Pair(0.5f, 0.28f),   // eyes
+            Pair(0.5f, 0.12f),   // forehead
+            Pair(0.5f, 0.55f),   // neck
+            Pair(0.35f, 0.42f),  // cheek left
+            Pair(0.65f, 0.42f)   // cheek right
+        )),
+        FACE(0.5f, 0.30f, "face", listOf(
+            Pair(0.5f, 0.55f),   // neck/chest
+            Pair(0.5f, 0.08f),   // top of hair
+            Pair(0.15f, 0.30f),  // background left
+            Pair(0.85f, 0.30f)   // background right
+        )),
+        HAIR(0.5f, 0.12f, "hair", listOf(
+            Pair(0.5f, 0.30f),   // face
+            Pair(0.5f, 0.50f),   // body
+            Pair(0.15f, 0.12f),  // background left
+            Pair(0.85f, 0.12f)   // background right
+        )),
         EARS(0.5f, 0.30f, "ears"),
-        NECK(0.5f, 0.48f, "neck"),
-        SHIRT(0.5f, 0.62f, "upper body"),
-        CHEST(0.5f, 0.58f, "chest"),
-        PANTS(0.5f, 0.78f, "lower body"),
-        SKIRT(0.5f, 0.75f, "skirt"),
-        SHOES(0.5f, 0.93f, "feet"),
+        NECK(0.5f, 0.48f, "neck", listOf(
+            Pair(0.5f, 0.30f),   // face
+            Pair(0.5f, 0.62f)    // shirt
+        )),
+        SHIRT(0.5f, 0.62f, "upper body", listOf(
+            Pair(0.5f, 0.30f),   // face
+            Pair(0.5f, 0.82f),   // pants
+            Pair(0.1f, 0.62f),   // background
+            Pair(0.9f, 0.62f)    // background
+        )),
+        CHEST(0.5f, 0.58f, "chest", listOf(
+            Pair(0.5f, 0.30f),   // face
+            Pair(0.5f, 0.78f)    // pants
+        )),
+        PANTS(0.5f, 0.78f, "lower body", listOf(
+            Pair(0.5f, 0.55f),   // shirt
+            Pair(0.5f, 0.95f)    // shoes
+        )),
+        SKIRT(0.5f, 0.75f, "skirt", listOf(
+            Pair(0.5f, 0.55f),
+            Pair(0.5f, 0.93f)
+        )),
+        SHOES(0.5f, 0.93f, "feet", listOf(
+            Pair(0.5f, 0.78f)    // pants
+        )),
         HANDS(0.35f, 0.60f, "hands"),
         FULL_BODY(0.5f, 0.50f, "full body"),
         BACKGROUND(0.1f, 0.1f, "background"),

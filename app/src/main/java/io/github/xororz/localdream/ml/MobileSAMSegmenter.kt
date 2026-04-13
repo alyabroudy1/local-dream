@@ -519,6 +519,149 @@ class MobileSAMSegmenter(private val context: Context) {
         }
     }
 
+    /**
+     * Run decoder with multiple positive and negative points.
+     * Positive points (label=1) = include this area
+     * Negative points (label=0) = exclude this area
+     */
+    private fun runDecoderMultiPoint(
+        encoderResults: EncoderResults,
+        positivePoints: List<Pair<Float, Float>>,
+        negativePoints: List<Pair<Float, Float>>,
+        imgWidth: Int, imgHeight: Int
+    ): Bitmap? {
+        return try {
+            val inputs = decoderInputs ?: return null
+            val totalPoints = positivePoints.size + negativePoints.size + 1 // +1 padding
+
+            Log.i(TAG, "runDecoderMultiPoint: ${positivePoints.size} pos, ${negativePoints.size} neg points")
+
+            val coordsArray = FloatArray(totalPoints * 2)
+            val labelsArray = FloatArray(totalPoints)
+            var idx = 0
+
+            for (p in positivePoints) {
+                val ex = p.first * encoderResults.scaleToFit
+                val ey = p.second * encoderResults.scaleToFit
+                coordsArray[idx * 2] = ex; coordsArray[idx * 2 + 1] = ey
+                labelsArray[idx] = 1.0f
+                Log.i(TAG, "  pos[$idx]: (${p.first}, ${p.second}) -> enc ($ex, $ey)")
+                idx++
+            }
+            for (p in negativePoints) {
+                val ex = p.first * encoderResults.scaleToFit
+                val ey = p.second * encoderResults.scaleToFit
+                coordsArray[idx * 2] = ex; coordsArray[idx * 2 + 1] = ey
+                labelsArray[idx] = 0.0f
+                Log.i(TAG, "  neg[$idx]: (${p.first}, ${p.second}) -> enc ($ex, $ey)")
+                idx++
+            }
+            coordsArray[idx * 2] = 0.0f; coordsArray[idx * 2 + 1] = 0.0f
+            labelsArray[idx] = -1.0f
+
+            val embTensor = ai.onnxruntime.OnnxTensor.createTensor(
+                ortEnvironment!!, encoderResults.imageEmbedding, longArrayOf(1, 256, 64, 64))
+            val coordsTensor = ai.onnxruntime.OnnxTensor.createTensor(
+                ortEnvironment!!, FloatBuffer.wrap(coordsArray), longArrayOf(1, totalPoints.toLong(), 2))
+            val labelsTensor = ai.onnxruntime.OnnxTensor.createTensor(
+                ortEnvironment!!, FloatBuffer.wrap(labelsArray), longArrayOf(1, totalPoints.toLong()))
+            val maskInTensor = ai.onnxruntime.OnnxTensor.createTensor(
+                ortEnvironment!!, FloatBuffer.wrap(FloatArray(256 * 256)), longArrayOf(1, 1, 256, 256))
+            val hasMaskT = ai.onnxruntime.OnnxTensor.createTensor(
+                ortEnvironment!!, FloatBuffer.wrap(floatArrayOf(0.0f)), longArrayOf(1))
+            val origSizeT = ai.onnxruntime.OnnxTensor.createTensor(
+                ortEnvironment!!, FloatBuffer.wrap(floatArrayOf(inputDim.toFloat(), inputDim.toFloat())), longArrayOf(2))
+
+            val inputMap = mapOf(
+                inputs.imageEmbeddingName to embTensor,
+                inputs.pointCoordsName to coordsTensor,
+                inputs.pointLabelsName to labelsTensor,
+                inputs.maskInputName to maskInTensor,
+                inputs.hasMaskInputName to hasMaskT,
+                inputs.origImSizeName to origSizeT
+            )
+
+            val outputs = decoderSession!!.run(inputMap)
+            val maskTensor = outputs[inputs.maskOutputName].get() as ai.onnxruntime.OnnxTensor
+            val maskShape = maskTensor.info.shape
+            val maskBuffer = maskTensor.floatBuffer
+
+            val numMasks: Int; val maskH: Int; val maskW: Int
+            when (maskShape.size) {
+                4 -> { numMasks = maskShape[1].toInt(); maskH = maskShape[2].toInt(); maskW = maskShape[3].toInt() }
+                3 -> { numMasks = maskShape[0].toInt(); maskH = maskShape[1].toInt(); maskW = maskShape[2].toInt() }
+                2 -> { numMasks = 1; maskH = maskShape[0].toInt(); maskW = maskShape[1].toInt() }
+                else -> { numMasks = 1; maskH = inputDim; maskW = inputDim }
+            }
+
+            var bestMaskIdx = 0
+            try {
+                val scoresTensor = outputs[inputs.scoresOutputName].get() as ai.onnxruntime.OnnxTensor
+                val scoresBuffer = scoresTensor.floatBuffer
+                var bestScore = Float.NEGATIVE_INFINITY
+                for (i in 0 until scoresBuffer.capacity()) {
+                    if (scoresBuffer.get(i) > bestScore) { bestScore = scoresBuffer.get(i); bestMaskIdx = i }
+                }
+                Log.i(TAG, "runDecoderMultiPoint: best mask=$bestMaskIdx, score=$bestScore")
+            } catch (_: Exception) {}
+
+            val maskOffset = bestMaskIdx * maskH * maskW
+            val rawMask = Bitmap.createBitmap(maskW, maskH, Bitmap.Config.ARGB_8888)
+            var whiteCount = 0
+            for (y in 0 until maskH) {
+                for (x in 0 until maskW) {
+                    val i = maskOffset + x + y * maskW
+                    if (i < maskBuffer.capacity() && maskBuffer.get(i) > 0f) {
+                        rawMask.setPixel(x, y, Color.WHITE); whiteCount++
+                    }
+                }
+            }
+            val pct = if (maskH * maskW > 0) (whiteCount * 100f / (maskH * maskW)) else 0f
+            Log.i(TAG, "runDecoderMultiPoint: white=$whiteCount (${String.format("%.1f", pct)}%)")
+
+            Bitmap.createScaledBitmap(rawMask, imgWidth, imgHeight, false)
+        } catch (e: Exception) {
+            Log.e(TAG, "runDecoderMultiPoint error: ${e.message}")
+            e.printStackTrace()
+            null
+        }
+    }
+
+    /**
+     * Precise segmentation using positive + negative points.
+     * For example, to select just the eyes: positive at eye location,
+     * negative at forehead, chin, cheeks to exclude the rest of the face.
+     */
+    suspend fun segmentPrecise(
+        bitmap: Bitmap,
+        positivePoints: List<Pair<Float, Float>>,
+        negativePoints: List<Pair<Float, Float>>
+    ): Bitmap? {
+        if (!isModelLoaded) return null
+        return withContext(Dispatchers.Default) {
+            try {
+                val bitmapHash = System.identityHashCode(bitmap)
+                if (cachedEncoderResults == null || cachedBitmapHash != bitmapHash) {
+                    Log.i(TAG, "segmentPrecise: Running encoder (${bitmap.width}x${bitmap.height})")
+                    val t = System.currentTimeMillis()
+                    cachedEncoderResults = runEncoder(bitmap)
+                    cachedBitmapHash = bitmapHash
+                    Log.i(TAG, "segmentPrecise: Encoder done in ${System.currentTimeMillis() - t}ms")
+                } else {
+                    Log.i(TAG, "segmentPrecise: Using cached encoder")
+                }
+                val enc = cachedEncoderResults ?: return@withContext null
+                val t = System.currentTimeMillis()
+                val mask = runDecoderMultiPoint(enc, positivePoints, negativePoints, bitmap.width, bitmap.height)
+                Log.i(TAG, "segmentPrecise: Decoder done in ${System.currentTimeMillis() - t}ms")
+                mask
+            } catch (e: Exception) {
+                Log.e(TAG, "segmentPrecise failed: ${e.message}")
+                null
+            }
+        }
+    }
+
     private fun generateGridPoints(numPoints: Int, width: Int, height: Int): List<Pair<Float, Float>> {
         val points = mutableListOf<Pair<Float, Float>>()
         val rows = kotlin.math.sqrt(numPoints.toDouble()).toInt()

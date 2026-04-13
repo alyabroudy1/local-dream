@@ -2883,39 +2883,30 @@ fun ModelRunScreen(
 
                     showInpaintScreen = false
 
-                    if (maskBase64.isNotEmpty()) {
-                        // ── Regular edit: Use mask for inpainting ──
+                    // Decode mask for inpainting
+                    try {
+                        val maskBytes = java.util.Base64.getDecoder().decode(maskBase64)
+                        maskBitmap = BitmapFactory.decodeByteArray(maskBytes, 0, maskBytes.size)
+                        Log.i("ModelRunScreen", "Smart Edit mask decoded: ${maskBitmap?.width}x${maskBitmap?.height}")
+                    } catch (e: Exception) {
+                        Log.e("ModelRunScreen", "Failed to decode mask: ${e.message}")
+                    }
+
+                    isInpaintMode = true
+
+                    scope.launch(Dispatchers.IO) {
                         try {
-                            val maskBytes = java.util.Base64.getDecoder().decode(maskBase64)
-                            maskBitmap = BitmapFactory.decodeByteArray(maskBytes, 0, maskBytes.size)
-                            Log.i("ModelRunScreen", "Smart Edit mask decoded: ${maskBitmap?.width}x${maskBitmap?.height}")
+                            val maskFile = File(context.filesDir, "mask.txt")
+                            maskFile.writeText(maskBase64)
+                            withContext(Dispatchers.Main) {
+                                base64EncodeDone = true
+                                Log.i("ModelRunScreen", "Smart Edit ready: prompt='$smartPrompt', denoise=$smartDenoise")
+                            }
                         } catch (e: Exception) {
-                            Log.e("ModelRunScreen", "Failed to decode mask: ${e.message}")
-                        }
-
-                        isInpaintMode = true
-
-                        scope.launch(Dispatchers.IO) {
-                            try {
-                                val maskFile = File(context.filesDir, "mask.txt")
-                                maskFile.writeText(maskBase64)
-                                withContext(Dispatchers.Main) {
-                                    base64EncodeDone = true
-                                    Log.i("ModelRunScreen", "Smart Edit ready (inpaint): prompt='$smartPrompt', denoise=$smartDenoise, hasMask=true")
-                                }
-                            } catch (e: Exception) {
-                                withContext(Dispatchers.Main) {
-                                    Toast.makeText(context, "Smart Edit failed: ${e.message}", Toast.LENGTH_SHORT).show()
-                                }
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(context, "Smart Edit failed: ${e.message}", Toast.LENGTH_SHORT).show()
                             }
                         }
-                    } else {
-                        // ── Pose change: No mask, img2img mode ──
-                        // Don't set maskBitmap or write mask.txt
-                        // Backend will do img2img (image + prompt + high denoise, no mask)
-                        maskBitmap = null
-                        isInpaintMode = false
-                        Log.i("ModelRunScreen", "Smart Edit ready (img2img): prompt='$smartPrompt', denoise=$smartDenoise, NO MASK")
                     }
                 },
                 onCancel = {

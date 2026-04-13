@@ -20,7 +20,8 @@ object SmartPromptProcessor {
         val cfgScale: Float,
         val targetKeywords: List<String>,
         val editType: EditType,
-        val targetRegion: TargetRegion
+        val targetRegion: TargetRegion,
+        val isPoseChange: Boolean = false
     )
 
     enum class EditType {
@@ -31,7 +32,6 @@ object SmartPromptProcessor {
         ADDITION,
         REPLACEMENT,
         ENHANCEMENT,
-        POSE_CHANGE,
         GENERAL
     }
 
@@ -137,6 +137,9 @@ object SmartPromptProcessor {
     fun process(userInstruction: String): ProcessedPrompt {
         val instruction = userInstruction.trim().lowercase()
 
+        // Check for pose change first (unsupported by SD 1.5 inpainting)
+        val isPoseChange = poseKeywords.any { instruction.contains(it) }
+
         val editType = detectEditType(instruction)
         val targetKeywords = extractTargetKeywords(instruction)
         val targetColor = extractColor(instruction)
@@ -145,16 +148,16 @@ object SmartPromptProcessor {
 
         val (prompt, negative) = buildOptimizedPrompt(instruction, editType, targetKeywords, targetColor, subject)
 
+        // Denoise tuned for crop-and-stitch (zoomed-in region gets full 512px resolution)
         val denoise = when (editType) {
-            EditType.COLOR_CHANGE -> 0.40f
-            EditType.ENHANCEMENT -> 0.35f
-            EditType.STYLE_CHANGE -> 0.55f
-            EditType.CLOTHING_CHANGE -> 0.65f
-            EditType.REMOVAL -> 0.75f
+            EditType.COLOR_CHANGE -> 0.55f
+            EditType.ENHANCEMENT -> 0.40f
+            EditType.STYLE_CHANGE -> 0.60f
+            EditType.CLOTHING_CHANGE -> 0.70f
+            EditType.REMOVAL -> 0.80f
             EditType.ADDITION -> 0.70f
-            EditType.REPLACEMENT -> 0.70f
-            EditType.POSE_CHANGE -> 0.85f
-            EditType.GENERAL -> 0.55f
+            EditType.REPLACEMENT -> 0.75f
+            EditType.GENERAL -> 0.60f
         }
 
         val cfg = when (editType) {
@@ -165,7 +168,6 @@ object SmartPromptProcessor {
             EditType.REMOVAL -> 8.5f
             EditType.ADDITION -> 8.0f
             EditType.REPLACEMENT -> 8.0f
-            EditType.POSE_CHANGE -> 9.0f
             EditType.GENERAL -> 7.5f
         }
 
@@ -176,7 +178,8 @@ object SmartPromptProcessor {
             cfgScale = cfg,
             targetKeywords = targetKeywords,
             editType = editType,
-            targetRegion = targetRegion
+            targetRegion = targetRegion,
+            isPoseChange = isPoseChange
         )
     }
 
@@ -202,7 +205,7 @@ object SmartPromptProcessor {
 
     private fun detectEditType(instruction: String): EditType {
         if (undressActions.any { instruction.contains(it) }) return EditType.CLOTHING_CHANGE
-        if (poseKeywords.any { instruction.contains(it) }) return EditType.POSE_CHANGE
+        // Note: pose changes are detected separately via isPoseChange flag
 
         val hasColor = colors.any { instruction.contains(it) }
         val hasColorAction = changeActions.any { instruction.contains(it) }
@@ -325,19 +328,6 @@ object SmartPromptProcessor {
             EditType.STYLE_CHANGE -> {
                 promptParts.add(extractDesiredDescription(instruction))
                 promptParts.addAll(listOf("artistic", "detailed", "high quality"))
-            }
-            EditType.POSE_CHANGE -> {
-                val desired = extractDesiredDescription(instruction)
-                promptParts.add("1girl")
-                promptParts.add(desired)
-                promptParts.addAll(listOf(
-                    "full body", "detailed anatomy", "correct proportions",
-                    "high quality", "sharp focus", "photorealistic"
-                ))
-                negativeParts.addAll(listOf(
-                    "extra limbs", "missing limbs", "extra arms", "extra legs",
-                    "bad hands", "bad proportions"
-                ))
             }
             EditType.GENERAL -> {
                 promptParts.add(extractDesiredDescription(instruction))

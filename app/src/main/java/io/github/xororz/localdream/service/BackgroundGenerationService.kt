@@ -24,6 +24,13 @@ import java.util.concurrent.TimeUnit
 import io.github.xororz.localdream.R
 import java.io.File
 import androidx.core.graphics.createBitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Rect
+import android.graphics.RectF
+import java.io.ByteArrayOutputStream
 
 class BackgroundGenerationService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.IO + Job())
@@ -195,6 +202,107 @@ class BackgroundGenerationService : Service() {
             val showProcess = preferences.getBoolean("show_diffusion_process", false)
             val showStride = preferences.getInt("show_diffusion_stride", 1)
 
+            // ── Crop-and-Stitch preprocessing ──
+            // When mask is present, crop to mask's bounding box so SD gets
+            // maximum resolution on the target area (the "Inpaint Only Masked" technique)
+            var cropInfo: CropInfo? = null
+            var originalBitmap: Bitmap? = null
+            var processedImage = image
+            var processedMask = mask
+
+            if (image != null && mask != null) {
+                try {
+                    val cropStartTime = System.currentTimeMillis()
+
+                    // Decode mask to find bounding box
+                    val maskBytes = Base64.getDecoder().decode(mask)
+                    val maskBitmap = BitmapFactory.decodeByteArray(maskBytes, 0, maskBytes.size)
+
+                    if (maskBitmap != null) {
+                        // Find mask bounding box
+                        var minX = maskBitmap.width; var minY = maskBitmap.height
+                        var maxX = 0; var maxY = 0
+                        for (y in 0 until maskBitmap.height) {
+                            for (x in 0 until maskBitmap.width) {
+                                val pixel = maskBitmap.getPixel(x, y)
+                                // Check if pixel is not fully transparent
+                                if (pixel != Color.TRANSPARENT && (pixel and 0x00FFFFFF) != 0) {
+                                    if (x < minX) minX = x
+                                    if (x > maxX) maxX = x
+                                    if (y < minY) minY = y
+                                    if (y > maxY) maxY = y
+                                }
+                            }
+                        }
+
+                        val maskW = maxX - minX
+                        val maskH = maxY - minY
+                        val imageArea = maskBitmap.width * maskBitmap.height
+                        val maskArea = maskW * maskH
+                        val maskRatio = maskArea.toFloat() / imageArea
+
+                        Log.i("BgGenService", "Mask bbox: ($minX,$minY)-($maxX,$maxY) ${maskW}x${maskH}, ratio=${String.format("%.2f", maskRatio)}")
+
+                        // Only crop if mask covers less than 70% of image (otherwise, whole-image processing is better)
+                        if (maskRatio < 0.70f && maskW > 10 && maskH > 10) {
+                            // Add padding (25% of bbox size, minimum 32px)
+                            val padX = maxOf(32, (maskW * 0.25f).toInt())
+                            val padY = maxOf(32, (maskH * 0.25f).toInt())
+                            val cropLeft = (minX - padX).coerceAtLeast(0)
+                            val cropTop = (minY - padY).coerceAtLeast(0)
+                            val cropRight = (maxX + padX).coerceAtMost(maskBitmap.width)
+                            val cropBottom = (maxY + padY).coerceAtMost(maskBitmap.height)
+                            val cropW = cropRight - cropLeft
+                            val cropH = cropBottom - cropTop
+
+                            Log.i("BgGenService", "Crop region: ($cropLeft,$cropTop)-($cropRight,$cropBottom) ${cropW}x${cropH}")
+
+                            // Decode original image
+                            val imgBytes = Base64.getDecoder().decode(image)
+                            val imgBitmap = BitmapFactory.decodeByteArray(imgBytes, 0, imgBytes.size)
+
+                            if (imgBitmap != null) {
+                                originalBitmap = imgBitmap
+                                cropInfo = CropInfo(cropLeft, cropTop, cropW, cropH, imgBitmap.width, imgBitmap.height)
+
+                                // Crop image and mask
+                                val croppedImg = Bitmap.createBitmap(imgBitmap, cropLeft, cropTop, cropW, cropH)
+                                val croppedMask = Bitmap.createBitmap(maskBitmap, cropLeft, cropTop, cropW, cropH)
+
+                                // Resize both to generation resolution
+                                val resizedImg = Bitmap.createScaledBitmap(croppedImg, width, height, true)
+                                val resizedMask = Bitmap.createScaledBitmap(croppedMask, width, height, true)
+
+                                // Re-encode image as PNG base64
+                                val imgBaos = ByteArrayOutputStream()
+                                resizedImg.compress(Bitmap.CompressFormat.PNG, 100, imgBaos)
+                                processedImage = Base64.getEncoder().encodeToString(imgBaos.toByteArray())
+
+                                val maskBaos = ByteArrayOutputStream()
+                                resizedMask.compress(Bitmap.CompressFormat.PNG, 100, maskBaos)
+                                processedMask = Base64.getEncoder().encodeToString(maskBaos.toByteArray())
+
+                                croppedImg.recycle()
+                                croppedMask.recycle()
+                                resizedImg.recycle()
+                                resizedMask.recycle()
+
+                                Log.i("BgGenService", "Crop-and-stitch: cropped ${cropW}x${cropH} → ${width}x${height} in ${System.currentTimeMillis() - cropStartTime}ms")
+                            }
+                        } else {
+                            Log.i("BgGenService", "Mask too large (${String.format("%.0f", maskRatio * 100)}%), using whole-image inpainting")
+                        }
+                        maskBitmap.recycle()
+                    }
+                } catch (e: Exception) {
+                    Log.w("BgGenService", "Crop-and-stitch preprocessing failed, using whole image: ${e.message}")
+                    cropInfo = null
+                    originalBitmap = null
+                    processedImage = image
+                    processedMask = mask
+                }
+            }
+
             val jsonObject = JSONObject().apply {
                 put("prompt", prompt)
                 put("negative_prompt", negativePrompt)
@@ -209,8 +317,8 @@ class BackgroundGenerationService : Service() {
                 put("show_diffusion_process", showProcess)
                 put("show_diffusion_stride", showStride)
                 seed?.let { put("seed", it) }
-                image?.let { put("image", it) }
-                mask?.let { put("mask", it) }
+                processedImage?.let { put("image", it) }
+                processedMask?.let { put("mask", it) }
             }
 
             val client = OkHttpClient.Builder()
@@ -385,6 +493,37 @@ class BackgroundGenerationService : Service() {
                                         "RGB conversion + Bitmap creation took: ${System.currentTimeMillis() - bitmapStartTime}ms"
                                     )
 
+                                    // 4. Crop-and-Stitch: Composite result back onto original
+                                    val finalBitmap = if (cropInfo != null && originalBitmap != null) {
+                                        val stitchStart = System.currentTimeMillis()
+                                        val ci = cropInfo!!
+
+                                        // Start with a copy of the original image
+                                        val composite = originalBitmap!!.copy(Bitmap.Config.ARGB_8888, true)
+                                        val canvas = Canvas(composite)
+
+                                        // Scale the generated result back to crop region size
+                                        val scaledResult = Bitmap.createScaledBitmap(bitmap, ci.cropW, ci.cropH, true)
+
+                                        // Draw the result onto the original at the crop position
+                                        canvas.drawBitmap(
+                                            scaledResult,
+                                            ci.cropX.toFloat(),
+                                            ci.cropY.toFloat(),
+                                            null
+                                        )
+
+                                        scaledResult.recycle()
+                                        bitmap.recycle()
+                                        originalBitmap!!.recycle()
+                                        originalBitmap = null
+
+                                        Log.i("BgGenService", "Crop-and-stitch composite: ${ci.cropW}x${ci.cropH} → (${ci.cropX},${ci.cropY}) on ${ci.origW}x${ci.origH} in ${System.currentTimeMillis() - stitchStart}ms")
+                                        composite
+                                    } else {
+                                        bitmap
+                                    }
+
                                     Log.d(
                                         "BgGenService",
                                         "=== Total processing time for complete message: ${System.currentTimeMillis() - completeStartTime}ms, size: ${resultWidth}x${resultHeight} ==="
@@ -392,7 +531,7 @@ class BackgroundGenerationService : Service() {
 
                                     updateState(
                                         GenerationState.Complete(
-                                            bitmap,
+                                            finalBitmap,
                                             returnedSeed
                                         )
                                     )
@@ -506,3 +645,12 @@ class BackgroundGenerationService : Service() {
         Log.d("GenerationService", "service destroyed, isServiceRunning set to false")
     }
 }
+
+private data class CropInfo(
+    val cropX: Int,
+    val cropY: Int,
+    val cropW: Int,
+    val cropH: Int,
+    val origW: Int,
+    val origH: Int
+)

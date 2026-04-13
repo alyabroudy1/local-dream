@@ -458,68 +458,60 @@ fun InpaintScreen(
         processedPrompt = processed
         Log.i("InpaintScreen", "Smart Edit: '${smartEditText}' → target=${processed.targetRegion.label}, type=${processed.editType}, prompt='${processed.inpaintPrompt}', denoise=${processed.denoiseStrength}")
 
+        // Pose changes are not supported by SD 1.5 inpainting
+        if (processed.isPoseChange) {
+            Log.i("InpaintScreen", "Pose change detected - not supported")
+            android.widget.Toast.makeText(
+                context,
+                "Pose changes aren't supported. Try describing appearance changes instead (e.g. 'make her hair blonde').",
+                android.widget.Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
         coroutineScope.launch {
             isLoading = true
             isSamProcessing = true
             try {
-                if (processed.editType == SmartPromptProcessor.EditType.POSE_CHANGE) {
-                    // ── POSE CHANGE: Skip SAM, use img2img (no mask) ──
-                    // Pose changes can't use inpainting because the mask constrains
-                    // the new pose to the old silhouette. img2img freely regenerates.
-                    samLoadingMessage = "Preparing pose change..."
-                    Log.i("InpaintScreen", "Pose change: using img2img (no mask)")
+                samLoadingMessage = "Finding ${processed.targetRegion.label}..."
+                val targetX = (originalBitmap.width * processed.targetRegion.relativeX)
+                val targetY = (originalBitmap.height * processed.targetRegion.relativeY)
+                Log.i("InpaintScreen", "Auto-targeting point (${targetX}, ${targetY}) for '${processed.targetRegion.label}'")
+
+                val samMask = withContext(Dispatchers.Default) {
+                    samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
+                }
+
+                if (samMask != null) {
+                    Log.i("InpaintScreen", "SAM auto-mask succeeded: ${samMask.width}x${samMask.height}")
+
+                    val finalMaskCanvas = Canvas(maskBitmap)
+                    finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    finalMaskCanvas.drawBitmap(samMask, 0f, 0f, null)
+                    updateDisplayMask()
+
+                    val base64String = withContext(Dispatchers.Default) {
+                        val byteArrayOutputStream = ByteArrayOutputStream()
+                        maskBitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
+                        val byteArray = byteArrayOutputStream.toByteArray()
+                        Base64.getEncoder().encodeToString(byteArray)
+                    }
 
                     if (onSmartEdit != null) {
                         onSmartEdit.invoke(
-                            "",  // Empty mask = img2img mode
+                            base64String,
                             processed.inpaintPrompt,
                             processed.negativePrompt,
                             processed.denoiseStrength,
                             processed.cfgScale
                         )
+                    } else {
+                        onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
                     }
                 } else {
-                    // ── Regular edit: Use SAM for masking ──
-                    samLoadingMessage = "Finding ${processed.targetRegion.label}..."
-                    val targetX = (originalBitmap.width * processed.targetRegion.relativeX)
-                    val targetY = (originalBitmap.height * processed.targetRegion.relativeY)
-                    Log.i("InpaintScreen", "Auto-targeting point (${targetX}, ${targetY}) for '${processed.targetRegion.label}'")
-
-                    val samMask = withContext(Dispatchers.Default) {
-                        samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
-                    }
-
-                    if (samMask != null) {
-                        Log.i("InpaintScreen", "SAM auto-mask succeeded: ${samMask.width}x${samMask.height}")
-
-                        val finalMaskCanvas = Canvas(maskBitmap)
-                        finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                        finalMaskCanvas.drawBitmap(samMask, 0f, 0f, null)
-                        updateDisplayMask()
-
-                        val base64String = withContext(Dispatchers.Default) {
-                            val byteArrayOutputStream = ByteArrayOutputStream()
-                            maskBitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
-                            val byteArray = byteArrayOutputStream.toByteArray()
-                            Base64.getEncoder().encodeToString(byteArray)
-                        }
-
-                        if (onSmartEdit != null) {
-                            onSmartEdit.invoke(
-                                base64String,
-                                processed.inpaintPrompt,
-                                processed.negativePrompt,
-                                processed.denoiseStrength,
-                                processed.cfgScale
-                            )
-                        } else {
-                            onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
-                        }
-                    } else {
-                        Log.w("InpaintScreen", "SAM auto-mask returned null. Try manual selection.")
-                        samLoadingMessage = "Could not find target. Try tapping manually."
-                        kotlinx.coroutines.delay(2000)
-                    }
+                    Log.w("InpaintScreen", "SAM auto-mask returned null. Try tapping manually.")
+                    samLoadingMessage = "Could not find target. Try tapping manually."
+                    kotlinx.coroutines.delay(2000)
                 }
             } catch (e: Exception) {
                 Log.e("InpaintScreen", "Smart Edit error: ${e.message}", e)

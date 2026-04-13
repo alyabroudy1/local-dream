@@ -31,6 +31,7 @@ object SmartPromptProcessor {
         ADDITION,
         REPLACEMENT,
         ENHANCEMENT,
+        POSE_CHANGE,
         GENERAL
     }
 
@@ -122,6 +123,16 @@ object SmartPromptProcessor {
     private val enhanceActions = listOf("improve", "enhance", "beautify", "fix", "refine", "sharpen")
     private val replaceActions = listOf("replace", "swap", "substitute")
     private val undressActions = listOf("undress", "naked", "nude", "topless", "bare", "strip")
+    private val poseKeywords = listOf(
+        "pose", "position", "posing", "bent", "bend", "bending", "bentover", "bent over",
+        "sitting", "sit", "seated", "stand", "standing", "kneel", "kneeling",
+        "lying", "lay", "laying", "crouch", "crouching", "squat", "squatting",
+        "lean", "leaning", "spread", "spreading",
+        "crawl", "crawling", "jump", "jumping", "dance", "dancing",
+        "arch", "arching", "twist", "twisting", "turn around",
+        "on all fours", "doggy", "from behind", "on her knees",
+        "on his knees", "hands and knees", "face down", "on back"
+    )
 
     fun process(userInstruction: String): ProcessedPrompt {
         val instruction = userInstruction.trim().lowercase()
@@ -142,6 +153,7 @@ object SmartPromptProcessor {
             EditType.REMOVAL -> 0.75f
             EditType.ADDITION -> 0.70f
             EditType.REPLACEMENT -> 0.70f
+            EditType.POSE_CHANGE -> 0.85f
             EditType.GENERAL -> 0.55f
         }
 
@@ -153,6 +165,7 @@ object SmartPromptProcessor {
             EditType.REMOVAL -> 8.5f
             EditType.ADDITION -> 8.0f
             EditType.REPLACEMENT -> 8.0f
+            EditType.POSE_CHANGE -> 9.0f
             EditType.GENERAL -> 7.5f
         }
 
@@ -189,6 +202,7 @@ object SmartPromptProcessor {
 
     private fun detectEditType(instruction: String): EditType {
         if (undressActions.any { instruction.contains(it) }) return EditType.CLOTHING_CHANGE
+        if (poseKeywords.any { instruction.contains(it) }) return EditType.POSE_CHANGE
 
         val hasColor = colors.any { instruction.contains(it) }
         val hasColorAction = changeActions.any { instruction.contains(it) }
@@ -311,6 +325,19 @@ object SmartPromptProcessor {
             EditType.STYLE_CHANGE -> {
                 promptParts.add(extractDesiredDescription(instruction))
                 promptParts.addAll(listOf("artistic", "detailed", "high quality"))
+            }
+            EditType.POSE_CHANGE -> {
+                val desired = extractDesiredDescription(instruction)
+                promptParts.add("1girl")
+                promptParts.add(desired)
+                promptParts.addAll(listOf(
+                    "full body", "detailed anatomy", "correct proportions",
+                    "high quality", "sharp focus", "photorealistic"
+                ))
+                negativeParts.addAll(listOf(
+                    "extra limbs", "missing limbs", "extra arms", "extra legs",
+                    "bad hands", "bad proportions"
+                ))
             }
             EditType.GENERAL -> {
                 promptParts.add(extractDesiredDescription(instruction))

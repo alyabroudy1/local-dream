@@ -456,55 +456,70 @@ fun InpaintScreen(
         if (smartEditText.isBlank()) return
         val processed = SmartPromptProcessor.process(smartEditText)
         processedPrompt = processed
-        Log.i("InpaintScreen", "Smart Edit: '${smartEditText}' → target=${processed.targetRegion.label} at (${processed.targetRegion.relativeX}, ${processed.targetRegion.relativeY}), prompt='${processed.inpaintPrompt}', denoise=${processed.denoiseStrength}")
+        Log.i("InpaintScreen", "Smart Edit: '${smartEditText}' → target=${processed.targetRegion.label}, type=${processed.editType}, prompt='${processed.inpaintPrompt}', denoise=${processed.denoiseStrength}")
 
         coroutineScope.launch {
             isLoading = true
             isSamProcessing = true
-            samLoadingMessage = "Finding ${processed.targetRegion.label}..."
             try {
-                // Calculate target point from region estimation
-                val targetX = (originalBitmap.width * processed.targetRegion.relativeX)
-                val targetY = (originalBitmap.height * processed.targetRegion.relativeY)
-                Log.i("InpaintScreen", "Auto-targeting point (${targetX}, ${targetY}) for '${processed.targetRegion.label}'")
-
-                // Run SAM at the estimated target point
-                val samMask = withContext(Dispatchers.Default) {
-                    samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
-                }
-
-                if (samMask != null) {
-                    Log.i("InpaintScreen", "SAM auto-mask succeeded: ${samMask.width}x${samMask.height}")
-
-                    // Apply mask to maskBitmap
-                    val finalMaskCanvas = Canvas(maskBitmap)
-                    finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
-                    finalMaskCanvas.drawBitmap(samMask, 0f, 0f, null)
-                    updateDisplayMask()
-
-                    // Encode mask to base64
-                    val base64String = withContext(Dispatchers.Default) {
-                        val byteArrayOutputStream = ByteArrayOutputStream()
-                        maskBitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
-                        val byteArray = byteArrayOutputStream.toByteArray()
-                        Base64.getEncoder().encodeToString(byteArray)
-                    }
+                if (processed.editType == SmartPromptProcessor.EditType.POSE_CHANGE) {
+                    // ── POSE CHANGE: Skip SAM, use img2img (no mask) ──
+                    // Pose changes can't use inpainting because the mask constrains
+                    // the new pose to the old silhouette. img2img freely regenerates.
+                    samLoadingMessage = "Preparing pose change..."
+                    Log.i("InpaintScreen", "Pose change: using img2img (no mask)")
 
                     if (onSmartEdit != null) {
                         onSmartEdit.invoke(
-                            base64String,
+                            "",  // Empty mask = img2img mode
                             processed.inpaintPrompt,
                             processed.negativePrompt,
                             processed.denoiseStrength,
                             processed.cfgScale
                         )
-                    } else {
-                        onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
                     }
                 } else {
-                    Log.w("InpaintScreen", "SAM auto-mask returned null. Try manual selection.")
-                    samLoadingMessage = "Could not find target. Try tapping manually."
-                    kotlinx.coroutines.delay(2000)
+                    // ── Regular edit: Use SAM for masking ──
+                    samLoadingMessage = "Finding ${processed.targetRegion.label}..."
+                    val targetX = (originalBitmap.width * processed.targetRegion.relativeX)
+                    val targetY = (originalBitmap.height * processed.targetRegion.relativeY)
+                    Log.i("InpaintScreen", "Auto-targeting point (${targetX}, ${targetY}) for '${processed.targetRegion.label}'")
+
+                    val samMask = withContext(Dispatchers.Default) {
+                        samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
+                    }
+
+                    if (samMask != null) {
+                        Log.i("InpaintScreen", "SAM auto-mask succeeded: ${samMask.width}x${samMask.height}")
+
+                        val finalMaskCanvas = Canvas(maskBitmap)
+                        finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                        finalMaskCanvas.drawBitmap(samMask, 0f, 0f, null)
+                        updateDisplayMask()
+
+                        val base64String = withContext(Dispatchers.Default) {
+                            val byteArrayOutputStream = ByteArrayOutputStream()
+                            maskBitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
+                            val byteArray = byteArrayOutputStream.toByteArray()
+                            Base64.getEncoder().encodeToString(byteArray)
+                        }
+
+                        if (onSmartEdit != null) {
+                            onSmartEdit.invoke(
+                                base64String,
+                                processed.inpaintPrompt,
+                                processed.negativePrompt,
+                                processed.denoiseStrength,
+                                processed.cfgScale
+                            )
+                        } else {
+                            onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
+                        }
+                    } else {
+                        Log.w("InpaintScreen", "SAM auto-mask returned null. Try manual selection.")
+                        samLoadingMessage = "Could not find target. Try tapping manually."
+                        kotlinx.coroutines.delay(2000)
+                    }
                 }
             } catch (e: Exception) {
                 Log.e("InpaintScreen", "Smart Edit error: ${e.message}", e)

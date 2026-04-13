@@ -296,7 +296,7 @@ class MobileSAMSegmenter(private val context: Context) {
         return try {
             Log.i(TAG, "runEncoder: starting, input ${bitmap.width}x${bitmap.height}")
 
-            // SAM expects longest side = 1024 with aspect ratio preserved, padded to square
+            // SAM expects longest side = inputDim, aspect ratio preserved, padded to square
             val origW = bitmap.width
             val origH = bitmap.height
             val maxDim = maxOf(origW, origH)
@@ -305,63 +305,55 @@ class MobileSAMSegmenter(private val context: Context) {
             val newH = (origH * scaleToFit).toInt()
 
             val resized = Bitmap.createScaledBitmap(bitmap, newW, newH, true)
-            Log.i(TAG, "runEncoder: resized to ${resized.width}x${resized.height} (fit in $inputDim)")
+            Log.i(TAG, "runEncoder: resized to ${resized.width}x${resized.height} (fit in $inputDim, scale=$scaleToFit)")
 
-            // NCHW format: (1, 3, 1024, 1024) - channel-first with zero padding
-            val pixels = FloatBuffer.allocate(1 * 3 * inputDim * inputDim)
+            // HWC format: (1024, 1024, 3) - row-major, interleaved RGB, zero-padded
+            // NOTE: This ONNX model expects raw pixel values [0, 255] (normalization is baked in)
+            val pixels = FloatBuffer.allocate(inputDim * inputDim * 3)
             pixels.rewind()
 
-            // Channel R (all R values first)
+            var debugCount = 0
             for (y in 0 until inputDim) {
                 for (x in 0 until inputDim) {
                     if (x < newW && y < newH) {
                         val pixel = resized.getPixel(x, y)
-                        pixels.put(((Color.red(pixel) / 255.0f) - mean[0]) / std[0])
-                    } else {
-                        pixels.put(0f) // Zero padding
-                    }
-                }
-            }
-            // Channel G
-            for (y in 0 until inputDim) {
-                for (x in 0 until inputDim) {
-                    if (x < newW && y < newH) {
-                        val pixel = resized.getPixel(x, y)
-                        pixels.put(((Color.green(pixel) / 255.0f) - mean[1]) / std[1])
+                        val r = Color.red(pixel).toFloat()
+                        val g = Color.green(pixel).toFloat()
+                        val b = Color.blue(pixel).toFloat()
+                        pixels.put(r)
+                        pixels.put(g)
+                        pixels.put(b)
+                        if (debugCount < 3) {
+                            Log.i(TAG, "runEncoder: pixel[$x,$y] RGB=($r, $g, $b)")
+                            debugCount++
+                        }
                     } else {
                         pixels.put(0f)
-                    }
-                }
-            }
-            // Channel B
-            for (y in 0 until inputDim) {
-                for (x in 0 until inputDim) {
-                    if (x < newW && y < newH) {
-                        val pixel = resized.getPixel(x, y)
-                        pixels.put(((Color.blue(pixel) / 255.0f) - mean[2]) / std[2])
-                    } else {
+                        pixels.put(0f)
                         pixels.put(0f)
                     }
                 }
             }
             pixels.rewind()
-            Log.i(TAG, "runEncoder: NCHW pixel buffer prepared (channel-first)")
+            Log.i(TAG, "runEncoder: HWC pixel buffer prepared (${inputDim}x${inputDim}x3, raw 0-255)")
 
             val inputTensor = ai.onnxruntime.OnnxTensor.createTensor(
                 ortEnvironment!!,
                 pixels,
-                longArrayOf(1, 3, inputDim.toLong(), inputDim.toLong())
+                longArrayOf(inputDim.toLong(), inputDim.toLong(), 3)
             )
-            Log.i(TAG, "runEncoder: input tensor shape [1, 3, $inputDim, $inputDim]")
+            Log.i(TAG, "runEncoder: input tensor shape [$inputDim, $inputDim, 3]")
 
             val outputs = encoderSession!!.run(mapOf(encoderInputName to inputTensor))
             Log.i(TAG, "runEncoder: inference done")
 
-            val imageEmbedding = (outputs[imageEmbeddingOutputName].get() as ai.onnxruntime.OnnxTensor).floatBuffer
+            val embeddingTensor = outputs[imageEmbeddingOutputName].get() as ai.onnxruntime.OnnxTensor
+            val imageEmbedding = embeddingTensor.floatBuffer
+            val embeddingShape = embeddingTensor.info.shape
             
-            Log.i(TAG, "runEncoder: imageEmbedding capacity: ${imageEmbedding.capacity()}")
+            Log.i(TAG, "runEncoder: embedding shape=${embeddingShape.toList()}, capacity=${imageEmbedding.capacity()}")
 
-            EncoderResults(imageEmbedding)
+            EncoderResults(imageEmbedding, scaleToFit, newW, newH)
         } catch (e: Exception) {
             Log.e(TAG, "Encoder error: ${e.message}")
             e.printStackTrace()
@@ -370,8 +362,12 @@ class MobileSAMSegmenter(private val context: Context) {
     }
 
     private data class EncoderResults(
-        val imageEmbedding: FloatBuffer
+        val imageEmbedding: FloatBuffer,
+        val scaleToFit: Float,    // scale factor from original to encoder space
+        val resizedW: Int,        // actual image width in encoder space (before padding)
+        val resizedH: Int         // actual image height in encoder space (before padding)
     )
+
 
     private fun runDecoder(encoderResults: EncoderResults, pointX: Float, pointY: Float, imgWidth: Int, imgHeight: Int): Bitmap? {
         return try {
@@ -382,17 +378,15 @@ class MobileSAMSegmenter(private val context: Context) {
                 return null
             }
 
-            // Transform point from original image space to encoder's padded 1024x1024 space
-            val maxDim = maxOf(imgWidth, imgHeight)
-            val scaleToEncoder = inputDim.toFloat() / maxDim
-            val encoderPointX = pointX * scaleToEncoder
-            val encoderPointY = pointY * scaleToEncoder
+            // Transform point from original image space to encoder's 1024x1024 space
+            val encoderPointX = pointX * encoderResults.scaleToFit
+            val encoderPointY = pointY * encoderResults.scaleToFit
             
-            Log.i(TAG, "runDecoder: encoder point=($encoderPointX, $encoderPointY), scale=$scaleToEncoder")
+            Log.i(TAG, "runDecoder: encoder point=($encoderPointX, $encoderPointY), scale=${encoderResults.scaleToFit}")
 
             val pointCoords = FloatBuffer.wrap(floatArrayOf(
                 encoderPointX, encoderPointY,
-                0.0f, 0.0f // Padding point required by SAM ONNX
+                0.0f, 0.0f // Padding point
             ))
             val pointLabels = FloatBuffer.wrap(floatArrayOf(
                 1.0f,  // Foreground positive point
@@ -430,9 +424,10 @@ class MobileSAMSegmenter(private val context: Context) {
                 longArrayOf(1)
             )
 
+            // orig_im_size should match the encoder input dimensions
             val origSizeTensor = ai.onnxruntime.OnnxTensor.createTensor(
                 ortEnvironment!!,
-                FloatBuffer.wrap(floatArrayOf(imgHeight.toFloat(), imgWidth.toFloat())),
+                FloatBuffer.wrap(floatArrayOf(inputDim.toFloat(), inputDim.toFloat())),
                 longArrayOf(2)
             )
 
@@ -447,45 +442,74 @@ class MobileSAMSegmenter(private val context: Context) {
             
             Log.i(TAG, "runDecoder: running inference...")
             val outputs = decoderSession!!.run(inputMap)
-            Log.i(TAG, "runDecoder: inference done")
+            
+            // Log all output names for debugging
+            val outputNames = outputs.map { it.key }
+            Log.i(TAG, "runDecoder: output names: $outputNames")
 
+            // Get mask output
             val maskTensor = outputs[inputs.maskOutputName].get() as ai.onnxruntime.OnnxTensor
-            val maskBuffer = maskTensor.floatBuffer
             val maskShape = maskTensor.info.shape
-            Log.i(TAG, "runDecoder: mask shape=${maskShape.toList()}, capacity=${maskBuffer.capacity()}")
+            Log.i(TAG, "runDecoder: mask shape=${maskShape.toList()}")
 
-            // Determine mask dimensions from output shape
-            // Output is typically (1, 1, H, W) or (1, H, W) or (H, W)
+            // Get scores to pick the best mask
+            var bestMaskIdx = 0
+            if (inputs.scoresOutputName.isNotEmpty()) {
+                try {
+                    val scoresTensor = outputs[inputs.scoresOutputName].get() as ai.onnxruntime.OnnxTensor
+                    val scoresBuffer = scoresTensor.floatBuffer
+                    val scoresShape = scoresTensor.info.shape
+                    Log.i(TAG, "runDecoder: scores shape=${scoresShape.toList()}")
+                    
+                    var bestScore = Float.NEGATIVE_INFINITY
+                    for (i in 0 until scoresBuffer.capacity()) {
+                        val score = scoresBuffer.get(i)
+                        Log.i(TAG, "runDecoder: mask[$i] score=$score")
+                        if (score > bestScore) {
+                            bestScore = score
+                            bestMaskIdx = i
+                        }
+                    }
+                    Log.i(TAG, "runDecoder: best mask index=$bestMaskIdx, score=$bestScore")
+                } catch (e: Exception) {
+                    Log.w(TAG, "runDecoder: could not read scores: ${e.message}")
+                }
+            }
+
+            val maskBuffer = maskTensor.floatBuffer
+
+            // Determine per-mask dimensions from output shape
+            // Output is typically (1, numMasks, H, W) 
+            val numMasks: Int
             val maskH: Int
             val maskW: Int
             when (maskShape.size) {
-                4 -> { maskH = maskShape[2].toInt(); maskW = maskShape[3].toInt() }
-                3 -> { maskH = maskShape[1].toInt(); maskW = maskShape[2].toInt() }
-                2 -> { maskH = maskShape[0].toInt(); maskW = maskShape[1].toInt() }
-                else -> { maskH = imgHeight; maskW = imgWidth }
+                4 -> { numMasks = maskShape[1].toInt(); maskH = maskShape[2].toInt(); maskW = maskShape[3].toInt() }
+                3 -> { numMasks = maskShape[0].toInt(); maskH = maskShape[1].toInt(); maskW = maskShape[2].toInt() }
+                2 -> { numMasks = 1; maskH = maskShape[0].toInt(); maskW = maskShape[1].toInt() }
+                else -> { numMasks = 1; maskH = inputDim; maskW = inputDim }
             }
-            Log.i(TAG, "runDecoder: mask dims=${maskW}x${maskH}")
+            Log.i(TAG, "runDecoder: numMasks=$numMasks, maskDims=${maskW}x${maskH}, bestIdx=$bestMaskIdx")
 
-            // Create mask at the decoder output resolution
+            // Read the best mask (skip earlier masks)
+            val maskOffset = bestMaskIdx * maskH * maskW
             val rawMask = Bitmap.createBitmap(maskW, maskH, Bitmap.Config.ARGB_8888)
             var whiteCount = 0
             for (y in 0 until maskH) {
                 for (x in 0 until maskW) {
-                    val idx = x + y * maskW
+                    val idx = maskOffset + x + y * maskW
                     if (idx < maskBuffer.capacity() && maskBuffer.get(idx) > 0f) {
                         rawMask.setPixel(x, y, Color.WHITE)
                         whiteCount++
                     }
                 }
             }
-            Log.i(TAG, "runDecoder: white pixels: $whiteCount / ${maskW * maskH}")
+            val totalPixels = maskW * maskH
+            val pct = if (totalPixels > 0) (whiteCount * 100f / totalPixels) else 0f
+            Log.i(TAG, "runDecoder: white=$whiteCount/$totalPixels (${String.format("%.1f", pct)}%)")
 
-            // Scale mask to original image dimensions if needed
-            val maskBitmap = if (maskW != imgWidth || maskH != imgHeight) {
-                Bitmap.createScaledBitmap(rawMask, imgWidth, imgHeight, false)
-            } else {
-                rawMask
-            }
+            // Scale the mask from encoder space to original image dimensions
+            val maskBitmap = Bitmap.createScaledBitmap(rawMask, imgWidth, imgHeight, false)
 
             maskBitmap
         } catch (e: Exception) {

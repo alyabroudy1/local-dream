@@ -2910,12 +2910,41 @@ fun ModelRunScreen(
                     }
                 },
                 onFaceSwapResult = { swappedBitmap ->
-                    // Face swap completed - display result directly (no SD generation needed)
+                    // Face swap completed - treat as a final result (like a generation)
                     showInpaintScreen = false
                     currentBitmap = swappedBitmap
                     croppedBitmap = swappedBitmap
-                    // Clear inpaint mode so it doesn't try to run SD
                     isInpaintMode = false
+
+                    // Set generation params so result area shows with save/share buttons
+                    val faceSwapParams = GenerationParameters(
+                        steps = 0,
+                        cfg = 0f,
+                        seed = null,
+                        prompt = "Face Swap",
+                        negativePrompt = "",
+                        generationTime = null,
+                        width = swappedBitmap.width,
+                        height = swappedBitmap.height,
+                        runOnCpu = false
+                    )
+                    generationParams = faceSwapParams
+                    imageVersion += 1
+
+                    // Save to history
+                    scope.launch(Dispatchers.IO) {
+                        val savedItem = historyManager.saveGeneratedImage(
+                            modelId = modelId,
+                            bitmap = swappedBitmap,
+                            params = faceSwapParams
+                        )
+                        if (savedItem != null) {
+                            withContext(Dispatchers.Main) {
+                                historyItems.add(0, savedItem)
+                            }
+                        }
+                    }
+
                     Toast.makeText(context, "Face swap applied!", Toast.LENGTH_SHORT).show()
                     Log.i("ModelRunScreen", "Face swap result: ${swappedBitmap.width}x${swappedBitmap.height}")
                 },

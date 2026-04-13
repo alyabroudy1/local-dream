@@ -4,64 +4,110 @@ package io.github.xororz.localdream.ml
  * Smart Prompt Processor for inpainting.
  * 
  * Converts natural language edit instructions into optimized Stable Diffusion
- * inpaint prompts with appropriate denoise strength recommendations.
+ * inpaint prompts with target location estimation for auto-masking.
  * 
  * Example: "change the girl's eyes to red" →
- *   prompt: "girl with vivid red eyes, detailed iris, sharp focus"
- *   denoise: 0.45
- *   targetKeywords: ["eyes", "eye"]
+ *   prompt: "vivid red eyes, detailed iris, sharp focus"
+ *   denoise: 0.40
+ *   targetRegion: EYES → estimated at (0.5, 0.32) relative position
  */
 object SmartPromptProcessor {
 
     data class ProcessedPrompt(
-        val inpaintPrompt: String,        // Optimized SD prompt
-        val negativePrompt: String,       // Negative prompt for better results
-        val denoiseStrength: Float,       // 0.0-1.0, how much to change
-        val cfgScale: Float,             // Guidance scale
-        val targetKeywords: List<String>, // Keywords to match objects
-        val editType: EditType            // Type of edit for UI hints
+        val inpaintPrompt: String,
+        val negativePrompt: String,
+        val denoiseStrength: Float,
+        val cfgScale: Float,
+        val targetKeywords: List<String>,
+        val editType: EditType,
+        val targetRegion: TargetRegion
     )
 
     enum class EditType {
-        COLOR_CHANGE,     // "change X color to Y" → low denoise
-        STYLE_CHANGE,     // "make X look like Y" → medium denoise
-        CLOTHING_CHANGE,  // "change outfit/shirt/dress" → medium-high denoise
-        REMOVAL,          // "remove X" → high denoise
-        ADDITION,         // "add X to Y" → high denoise
-        REPLACEMENT,      // "replace X with Y" → high denoise
-        ENHANCEMENT,      // "make X more beautiful" → low denoise
-        GENERAL           // fallback
+        COLOR_CHANGE,
+        STYLE_CHANGE,
+        CLOTHING_CHANGE,
+        REMOVAL,
+        ADDITION,
+        REPLACEMENT,
+        ENHANCEMENT,
+        GENERAL
     }
 
-    // Body/person part keywords for targeting
-    private val bodyParts = mapOf(
-        "eye" to listOf("eyes", "eye", "iris", "pupil"),
-        "hair" to listOf("hair", "hairstyle", "bangs", "locks"),
-        "face" to listOf("face", "facial", "cheek", "cheeks"),
-        "lip" to listOf("lips", "lip", "mouth"),
-        "nose" to listOf("nose"),
-        "ear" to listOf("ears", "ear"),
-        "hand" to listOf("hands", "hand", "fingers", "finger"),
-        "skin" to listOf("skin", "complexion"),
-        "nail" to listOf("nails", "nail", "fingernails")
+    /**
+     * Target region with estimated relative position in image (0.0 to 1.0).
+     * For portrait-oriented images with a centered person.
+     */
+    enum class TargetRegion(
+        val relativeX: Float, val relativeY: Float,
+        val label: String
+    ) {
+        EYES(0.5f, 0.28f, "eyes"),
+        NOSE(0.5f, 0.35f, "nose"),
+        MOUTH(0.5f, 0.42f, "mouth"),
+        FACE(0.5f, 0.30f, "face"),
+        HAIR(0.5f, 0.12f, "hair"),
+        EARS(0.5f, 0.30f, "ears"),
+        NECK(0.5f, 0.48f, "neck"),
+        SHIRT(0.5f, 0.62f, "upper body"),
+        CHEST(0.5f, 0.58f, "chest"),
+        PANTS(0.5f, 0.78f, "lower body"),
+        SKIRT(0.5f, 0.75f, "skirt"),
+        SHOES(0.5f, 0.93f, "feet"),
+        HANDS(0.35f, 0.60f, "hands"),
+        FULL_BODY(0.5f, 0.50f, "full body"),
+        BACKGROUND(0.1f, 0.1f, "background"),
+        CENTER(0.5f, 0.50f, "center"),
+        UNKNOWN(0.5f, 0.50f, "region");
+    }
+
+    // Body/person part keywords → target region
+    private val bodyPartToRegion = mapOf(
+        "eye" to TargetRegion.EYES, "eyes" to TargetRegion.EYES,
+        "iris" to TargetRegion.EYES, "pupil" to TargetRegion.EYES,
+        "nose" to TargetRegion.NOSE,
+        "mouth" to TargetRegion.MOUTH, "lips" to TargetRegion.MOUTH,
+        "lip" to TargetRegion.MOUTH, "teeth" to TargetRegion.MOUTH,
+        "smile" to TargetRegion.MOUTH,
+        "face" to TargetRegion.FACE, "facial" to TargetRegion.FACE,
+        "cheek" to TargetRegion.FACE, "cheeks" to TargetRegion.FACE,
+        "forehead" to TargetRegion.FACE, "chin" to TargetRegion.FACE,
+        "head" to TargetRegion.FACE,
+        "hair" to TargetRegion.HAIR, "hairstyle" to TargetRegion.HAIR,
+        "bangs" to TargetRegion.HAIR, "locks" to TargetRegion.HAIR,
+        "ear" to TargetRegion.EARS, "ears" to TargetRegion.EARS,
+        "neck" to TargetRegion.NECK, "necklace" to TargetRegion.NECK,
+        "hand" to TargetRegion.HANDS, "hands" to TargetRegion.HANDS,
+        "finger" to TargetRegion.HANDS, "fingers" to TargetRegion.HANDS,
+        "nail" to TargetRegion.HANDS, "nails" to TargetRegion.HANDS,
+        "skin" to TargetRegion.FULL_BODY, "body" to TargetRegion.FULL_BODY,
+        "chest" to TargetRegion.CHEST, "breast" to TargetRegion.CHEST,
+        "background" to TargetRegion.BACKGROUND, "bg" to TargetRegion.BACKGROUND
     )
 
-    // Clothing keywords
-    private val clothingParts = mapOf(
-        "shirt" to listOf("shirt", "top", "blouse", "t-shirt", "tshirt"),
-        "dress" to listOf("dress", "gown", "outfit"),
-        "pants" to listOf("pants", "trousers", "jeans", "shorts"),
-        "skirt" to listOf("skirt", "miniskirt"),
-        "shoes" to listOf("shoes", "shoe", "boots", "boot", "heels", "sneakers"),
-        "jacket" to listOf("jacket", "coat", "hoodie", "sweater"),
-        "hat" to listOf("hat", "cap", "headwear"),
-        "glasses" to listOf("glasses", "sunglasses", "spectacles"),
-        "underwear" to listOf("underwear", "bra", "panties", "lingerie", "bikini"),
-        "swimsuit" to listOf("swimsuit", "swimwear", "bikini"),
-        "clothing" to listOf("clothing", "clothes", "outfit", "attire", "wardrobe")
+    // Clothing keywords → target region
+    private val clothingToRegion = mapOf(
+        "shirt" to TargetRegion.SHIRT, "top" to TargetRegion.SHIRT,
+        "blouse" to TargetRegion.SHIRT, "t-shirt" to TargetRegion.SHIRT,
+        "tshirt" to TargetRegion.SHIRT, "sweater" to TargetRegion.SHIRT,
+        "jacket" to TargetRegion.SHIRT, "coat" to TargetRegion.SHIRT,
+        "hoodie" to TargetRegion.SHIRT,
+        "dress" to TargetRegion.FULL_BODY, "gown" to TargetRegion.FULL_BODY,
+        "outfit" to TargetRegion.FULL_BODY, "clothing" to TargetRegion.FULL_BODY,
+        "clothes" to TargetRegion.FULL_BODY, "attire" to TargetRegion.FULL_BODY,
+        "pants" to TargetRegion.PANTS, "trousers" to TargetRegion.PANTS,
+        "jeans" to TargetRegion.PANTS, "shorts" to TargetRegion.PANTS,
+        "skirt" to TargetRegion.SKIRT, "miniskirt" to TargetRegion.SKIRT,
+        "shoes" to TargetRegion.SHOES, "shoe" to TargetRegion.SHOES,
+        "boots" to TargetRegion.SHOES, "boot" to TargetRegion.SHOES,
+        "heels" to TargetRegion.SHOES, "sneakers" to TargetRegion.SHOES,
+        "hat" to TargetRegion.HAIR, "cap" to TargetRegion.HAIR,
+        "glasses" to TargetRegion.EYES, "sunglasses" to TargetRegion.EYES,
+        "bra" to TargetRegion.CHEST, "bikini" to TargetRegion.CHEST,
+        "underwear" to TargetRegion.PANTS, "panties" to TargetRegion.PANTS,
+        "lingerie" to TargetRegion.FULL_BODY
     )
 
-    // Color keywords
     private val colors = listOf(
         "red", "blue", "green", "yellow", "purple", "pink", "orange",
         "black", "white", "brown", "gray", "grey", "gold", "golden",
@@ -70,38 +116,24 @@ object SmartPromptProcessor {
         "teal", "cyan", "magenta", "lavender", "coral", "ivory"
     )
 
-    // Action verbs that indicate edit type
-    private val removeActions = listOf("remove", "delete", "erase", "get rid of", "take off", "strip")
+    private val removeActions = listOf("remove", "delete", "erase", "get rid of", "take off")
     private val addActions = listOf("add", "put", "place", "give")
     private val changeActions = listOf("change", "make", "turn", "transform", "convert", "switch")
     private val enhanceActions = listOf("improve", "enhance", "beautify", "fix", "refine", "sharpen")
     private val replaceActions = listOf("replace", "swap", "substitute")
     private val undressActions = listOf("undress", "naked", "nude", "topless", "bare", "strip")
 
-    /**
-     * Process a natural language edit instruction into an optimized inpaint prompt.
-     */
     fun process(userInstruction: String): ProcessedPrompt {
         val instruction = userInstruction.trim().lowercase()
-        
-        // Detect edit type
+
         val editType = detectEditType(instruction)
-        
-        // Extract target keywords
         val targetKeywords = extractTargetKeywords(instruction)
-        
-        // Extract color if present
         val targetColor = extractColor(instruction)
-        
-        // Extract the subject/object being described
         val subject = extractSubject(instruction)
-        
-        // Build optimized prompt
-        val (prompt, negative) = buildOptimizedPrompt(
-            instruction, editType, targetKeywords, targetColor, subject
-        )
-        
-        // Determine denoise strength based on edit type
+        val targetRegion = detectTargetRegion(instruction)
+
+        val (prompt, negative) = buildOptimizedPrompt(instruction, editType, targetKeywords, targetColor, subject)
+
         val denoise = when (editType) {
             EditType.COLOR_CHANGE -> 0.40f
             EditType.ENHANCEMENT -> 0.35f
@@ -112,7 +144,7 @@ object SmartPromptProcessor {
             EditType.REPLACEMENT -> 0.70f
             EditType.GENERAL -> 0.55f
         }
-        
+
         val cfg = when (editType) {
             EditType.COLOR_CHANGE -> 7.5f
             EditType.ENHANCEMENT -> 7.0f
@@ -123,81 +155,75 @@ object SmartPromptProcessor {
             EditType.REPLACEMENT -> 8.0f
             EditType.GENERAL -> 7.5f
         }
-        
+
         return ProcessedPrompt(
             inpaintPrompt = prompt,
             negativePrompt = negative,
             denoiseStrength = denoise,
             cfgScale = cfg,
             targetKeywords = targetKeywords,
-            editType = editType
+            editType = editType,
+            targetRegion = targetRegion
         )
     }
 
-    private fun detectEditType(instruction: String): EditType {
-        // Check for undress/nude actions first
-        if (undressActions.any { instruction.contains(it) }) {
-            return EditType.CLOTHING_CHANGE
+    /**
+     * Detect WHERE in the image the edit target is, based on keyword analysis.
+     * Returns a TargetRegion with estimated relative (x, y) position.
+     */
+    private fun detectTargetRegion(instruction: String): TargetRegion {
+        // Check body parts first (more specific)
+        for ((keyword, region) in bodyPartToRegion) {
+            if (instruction.contains(keyword)) return region
         }
-        
-        // Check for color changes: "change X color to Y", "make X red"
+        // Check clothing
+        for ((keyword, region) in clothingToRegion) {
+            if (instruction.contains(keyword)) return region
+        }
+        // Fallback
+        if (instruction.contains("background") || instruction.contains("bg")) {
+            return TargetRegion.BACKGROUND
+        }
+        return TargetRegion.CENTER
+    }
+
+    private fun detectEditType(instruction: String): EditType {
+        if (undressActions.any { instruction.contains(it) }) return EditType.CLOTHING_CHANGE
+
         val hasColor = colors.any { instruction.contains(it) }
         val hasColorAction = changeActions.any { instruction.contains(it) }
         if (hasColor && hasColorAction) {
-            // Check if it's about clothing or body parts
-            val hasClothing = clothingParts.values.flatten().any { instruction.contains(it) }
+            val hasClothing = clothingToRegion.keys.any { instruction.contains(it) }
             if (hasClothing) return EditType.CLOTHING_CHANGE
             return EditType.COLOR_CHANGE
         }
-        
+
         if (removeActions.any { instruction.contains(it) }) return EditType.REMOVAL
         if (addActions.any { instruction.contains(it) }) return EditType.ADDITION
         if (replaceActions.any { instruction.contains(it) }) return EditType.REPLACEMENT
         if (enhanceActions.any { instruction.contains(it) }) return EditType.ENHANCEMENT
         if (hasColor) return EditType.COLOR_CHANGE
-        
-        // Check for clothing keywords
-        if (clothingParts.values.flatten().any { instruction.contains(it) }) {
-            return EditType.CLOTHING_CHANGE
-        }
-        
+
+        // "change X to Y" without color → REPLACEMENT
+        if (hasColorAction && instruction.contains(" to ")) return EditType.REPLACEMENT
+
+        if (clothingToRegion.keys.any { instruction.contains(it) }) return EditType.CLOTHING_CHANGE
+
         return EditType.GENERAL
     }
 
     private fun extractTargetKeywords(instruction: String): List<String> {
         val keywords = mutableListOf<String>()
-        
-        // Check body parts
-        for ((_, variants) in bodyParts) {
-            for (variant in variants) {
-                if (instruction.contains(variant)) {
-                    keywords.addAll(variants)
-                    break
-                }
-            }
+        for ((keyword, _) in bodyPartToRegion) {
+            if (instruction.contains(keyword)) keywords.add(keyword)
         }
-        
-        // Check clothing
-        for ((_, variants) in clothingParts) {
-            for (variant in variants) {
-                if (instruction.contains(variant)) {
-                    keywords.addAll(variants)
-                    break
-                }
-            }
+        for ((keyword, _) in clothingToRegion) {
+            if (instruction.contains(keyword)) keywords.add(keyword)
         }
-        
-        // Also add person-related keywords if referring to a person
-        val personWords = listOf("girl", "boy", "man", "woman", "person", "her", "his", "she", "he")
-        if (personWords.any { instruction.contains(it) }) {
-            keywords.addAll(listOf("person", "figure", "body"))
-        }
-        
         return keywords.distinct()
     }
 
     private fun extractColor(instruction: String): String? {
-        // Find the color mentioned, preferring later mentions (usually the target)
         var lastColor: String? = null
         var lastIndex = -1
         for (color in colors) {
@@ -211,20 +237,14 @@ object SmartPromptProcessor {
     }
 
     private fun extractSubject(instruction: String): String {
-        // Try to extract what is being described
-        // Look for patterns like "the girl", "her eyes", "the dress"
         val patterns = listOf(
             Regex("(?:the |a |an |her |his |their )(\\w+(?:'s \\w+)?)"),
             Regex("(?:of |on )(\\w+)")
         )
-        
         for (pattern in patterns) {
             val match = pattern.find(instruction)
-            if (match != null) {
-                return match.groupValues[1]
-            }
+            if (match != null) return match.groupValues[1]
         }
-        
         return ""
     }
 
@@ -243,144 +263,83 @@ object SmartPromptProcessor {
 
         when (editType) {
             EditType.COLOR_CHANGE -> {
-                // For color changes, describe the desired result
                 val bodyPart = targetKeywords.firstOrNull() ?: subject
                 if (targetColor != null) {
                     promptParts.add("$targetColor $bodyPart")
                     promptParts.add("vivid $targetColor color")
-                    promptParts.add("detailed")
-                    
-                    // Add specific quality hints based on body part
                     if (bodyPart in listOf("eyes", "eye", "iris")) {
-                        promptParts.add("detailed iris")
-                        promptParts.add("sharp eyes")
-                        promptParts.add("beautiful $targetColor eyes")
+                        promptParts.add("detailed iris"); promptParts.add("beautiful $targetColor eyes")
                     } else if (bodyPart in listOf("hair", "hairstyle")) {
-                        promptParts.add("beautiful $targetColor hair")
-                        promptParts.add("flowing hair")
-                        promptParts.add("shiny")
+                        promptParts.add("beautiful $targetColor hair"); promptParts.add("shiny")
                     } else if (bodyPart in listOf("lips", "lip")) {
-                        promptParts.add("$targetColor lipstick")
-                        promptParts.add("glossy lips")
+                        promptParts.add("$targetColor lipstick"); promptParts.add("glossy lips")
                     }
                 }
-                promptParts.add("high quality")
-                promptParts.add("sharp focus")
-                promptParts.add("photorealistic")
+                promptParts.addAll(listOf("detailed", "high quality", "sharp focus", "photorealistic"))
             }
-
             EditType.CLOTHING_CHANGE -> {
-                // For clothing changes
                 if (undressActions.any { instruction.contains(it) }) {
-                    promptParts.add("bare skin")
-                    promptParts.add("exposed body")
-                    promptParts.add("no clothing")
-                    promptParts.add("detailed skin texture")
-                    promptParts.add("anatomically correct")
-                    negativeParts.add("clothing")
-                    negativeParts.add("fabric")
+                    promptParts.addAll(listOf("bare skin", "exposed body", "no clothing", "detailed skin texture"))
+                    negativeParts.addAll(listOf("clothing", "fabric"))
                 } else {
-                    if (targetColor != null) {
-                        val clothing = clothingParts.entries
-                            .firstOrNull { (_, v) -> v.any { instruction.contains(it) } }
-                            ?.key ?: "clothing"
+                    val desired = extractDesiredDescription(instruction)
+                    if (targetColor != null && desired.isBlank()) {
+                        val clothing = clothingToRegion.keys.firstOrNull { instruction.contains(it) } ?: "clothing"
                         promptParts.add("$targetColor $clothing")
-                        promptParts.add("beautiful $targetColor fabric")
                     } else {
-                        // Extract the desired clothing description from the instruction
-                        promptParts.add(extractDesiredDescription(instruction))
+                        promptParts.add(desired)
                     }
-                    promptParts.add("detailed fabric texture")
-                    promptParts.add("high quality")
-                    promptParts.add("fashion photography")
+                    promptParts.addAll(listOf("detailed fabric texture", "high quality", "fashion photography"))
                 }
             }
-
             EditType.REMOVAL -> {
-                promptParts.add("clean background")
-                promptParts.add("empty space")
-                promptParts.add("seamless")
-                promptParts.add("natural fill")
-                // Add target to negative prompt
+                promptParts.addAll(listOf("clean background", "empty space", "seamless", "natural fill"))
                 targetKeywords.forEach { negativeParts.add(it) }
             }
-
+            EditType.REPLACEMENT -> {
+                val desired = extractDesiredDescription(instruction)
+                promptParts.add(desired)
+                promptParts.addAll(listOf("detailed", "high quality", "realistic", "sharp focus"))
+            }
             EditType.ADDITION -> {
                 promptParts.add(extractDesiredDescription(instruction))
-                promptParts.add("detailed")
-                promptParts.add("high quality")
-                promptParts.add("natural lighting")
+                promptParts.addAll(listOf("detailed", "high quality", "natural lighting"))
             }
-
-            EditType.REPLACEMENT -> {
-                promptParts.add(extractDesiredDescription(instruction))
-                promptParts.add("detailed")
-                promptParts.add("high quality")
-                promptParts.add("realistic")
-            }
-
             EditType.ENHANCEMENT -> {
-                promptParts.add("enhanced")
-                promptParts.add("high quality")
-                promptParts.add("sharp focus")
-                promptParts.add("detailed")
-                promptParts.add("4k")
-                promptParts.add("professional photography")
+                promptParts.addAll(listOf("enhanced", "high quality", "sharp focus", "detailed", "4k", "professional photography"))
             }
-
             EditType.STYLE_CHANGE -> {
                 promptParts.add(extractDesiredDescription(instruction))
-                promptParts.add("artistic")
-                promptParts.add("detailed")
-                promptParts.add("high quality")
+                promptParts.addAll(listOf("artistic", "detailed", "high quality"))
             }
-
             EditType.GENERAL -> {
-                // Use the instruction as-is but enhance it
                 promptParts.add(extractDesiredDescription(instruction))
-                promptParts.add("high quality")
-                promptParts.add("detailed")
-                promptParts.add("sharp focus")
+                promptParts.addAll(listOf("high quality", "detailed", "sharp focus"))
             }
         }
 
-        val prompt = promptParts.filter { it.isNotBlank() }.joinToString(", ")
-        val negative = negativeParts.distinct().joinToString(", ")
-
-        return Pair(prompt, negative)
+        return Pair(
+            promptParts.filter { it.isNotBlank() }.joinToString(", "),
+            negativeParts.distinct().joinToString(", ")
+        )
     }
 
-    /**
-     * Extract what the user wants the result to look like from their instruction.
-     * e.g., "change her shirt to a red silk dress" → "red silk dress"
-     * e.g., "make her hair longer and blonde" → "longer blonde hair"
-     */
     private fun extractDesiredDescription(instruction: String): String {
-        // Try common patterns
         val patterns = listOf(
             Regex("(?:to |into |with |wearing )(a |an )?(.+)$"),
             Regex("(?:make |turn )(?:it |her |him |the \\w+ )(.+)$"),
             Regex("(?:give )(?:her |him |the \\w+ )(a |an )?(.+)$")
         )
-
         for (pattern in patterns) {
             val match = pattern.find(instruction)
-            if (match != null) {
-                return match.groupValues.last().trim()
-            }
+            if (match != null) return match.groupValues.last().trim()
         }
 
-        // Fallback: remove action verbs and return the rest
         var result = instruction
-        val allActions = removeActions + addActions + changeActions + 
-                         enhanceActions + replaceActions + undressActions
-        for (action in allActions) {
-            result = result.replace(action, "").trim()
-        }
-        // Remove common filler words
+        val allActions = removeActions + addActions + changeActions + enhanceActions + replaceActions + undressActions
+        for (action in allActions) { result = result.replace(action, "").trim() }
         result = result.replace(Regex("\\b(the|a|an|her|his|their|to|from|of|in|on|with)\\b"), " ")
             .replace(Regex("\\s+"), " ").trim()
-
         return result
     }
 }

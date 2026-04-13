@@ -456,53 +456,62 @@ fun InpaintScreen(
         if (smartEditText.isBlank()) return
         val processed = SmartPromptProcessor.process(smartEditText)
         processedPrompt = processed
-        Log.i("InpaintScreen", "Smart Edit: '${smartEditText}' → prompt='${processed.inpaintPrompt}', denoise=${processed.denoiseStrength}")
+        Log.i("InpaintScreen", "Smart Edit: '${smartEditText}' → target=${processed.targetRegion.label} at (${processed.targetRegion.relativeX}, ${processed.targetRegion.relativeY}), prompt='${processed.inpaintPrompt}', denoise=${processed.denoiseStrength}")
 
         coroutineScope.launch {
             isLoading = true
+            isSamProcessing = true
+            samLoadingMessage = "Finding ${processed.targetRegion.label}..."
             try {
-                // Build the mask from selected objects
-                val finalMaskCanvas = Canvas(maskBitmap)
-                finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                // Calculate target point from region estimation
+                val targetX = (originalBitmap.width * processed.targetRegion.relativeX)
+                val targetY = (originalBitmap.height * processed.targetRegion.relativeY)
+                Log.i("InpaintScreen", "Auto-targeting point (${targetX}, ${targetY}) for '${processed.targetRegion.label}'")
 
-                for (selId in selectedObjectIds) {
-                    val selObj = detectedObjects.find { it.id == selId } ?: continue
-                    if (selObj.mask != null && !selObj.mask.isRecycled) {
-                        val srcW = min(selObj.mask.width, originalBitmap.width)
-                        val srcH = min(selObj.mask.height, originalBitmap.height)
-                        finalMaskCanvas.drawBitmap(
-                            selObj.mask,
-                            android.graphics.Rect(0, 0, srcW, srcH),
-                            android.graphics.Rect(0, 0, originalBitmap.width, originalBitmap.height),
-                            null
-                        )
+                // Run SAM at the estimated target point
+                val samMask = withContext(Dispatchers.Default) {
+                    samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
+                }
+
+                if (samMask != null) {
+                    Log.i("InpaintScreen", "SAM auto-mask succeeded: ${samMask.width}x${samMask.height}")
+
+                    // Apply mask to maskBitmap
+                    val finalMaskCanvas = Canvas(maskBitmap)
+                    finalMaskCanvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+                    finalMaskCanvas.drawBitmap(samMask, 0f, 0f, null)
+                    updateDisplayMask()
+
+                    // Encode mask to base64
+                    val base64String = withContext(Dispatchers.Default) {
+                        val byteArrayOutputStream = ByteArrayOutputStream()
+                        maskBitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
+                        val byteArray = byteArrayOutputStream.toByteArray()
+                        Base64.getEncoder().encodeToString(byteArray)
                     }
-                }
 
-                // Encode mask to base64
-                val base64String = withContext(Dispatchers.Default) {
-                    val byteArrayOutputStream = ByteArrayOutputStream()
-                    maskBitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
-                    val byteArray = byteArrayOutputStream.toByteArray()
-                    Base64.getEncoder().encodeToString(byteArray)
-                }
-
-                if (onSmartEdit != null) {
-                    onSmartEdit.invoke(
-                        base64String,
-                        processed.inpaintPrompt,
-                        processed.negativePrompt,
-                        processed.denoiseStrength,
-                        processed.cfgScale
-                    )
+                    if (onSmartEdit != null) {
+                        onSmartEdit.invoke(
+                            base64String,
+                            processed.inpaintPrompt,
+                            processed.negativePrompt,
+                            processed.denoiseStrength,
+                            processed.cfgScale
+                        )
+                    } else {
+                        onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
+                    }
                 } else {
-                    // Fallback: use normal inpaint complete
-                    onInpaintComplete(base64String, originalBitmap, maskBitmap, pathHistory.toList())
+                    Log.w("InpaintScreen", "SAM auto-mask returned null. Try manual selection.")
+                    samLoadingMessage = "Could not find target. Try tapping manually."
+                    kotlinx.coroutines.delay(2000)
                 }
             } catch (e: Exception) {
                 Log.e("InpaintScreen", "Smart Edit error: ${e.message}", e)
             } finally {
                 isLoading = false
+                isSamProcessing = false
+                samLoadingMessage = ""
             }
         }
     }
@@ -1015,7 +1024,7 @@ fun InpaintScreen(
                                     }
                                 }
 
-                                // Auto Detect (scan all objects)
+                                // Smart Edit (prompt-driven auto-mask)
                                 Box(
                                     modifier = Modifier.size(36.dp),
                                     contentAlignment = Alignment.Center
@@ -1034,14 +1043,9 @@ fun InpaintScreen(
                                     }
 
                                     IconButton(
-                                        onClick = {
-                                            currentToolMode = ToolMode.AUTO_DETECT
-                                            if (detectedObjects.isEmpty() && !isScanning) {
-                                                scanObjects()
-                                            }
-                                        },
+                                        onClick = { currentToolMode = ToolMode.AUTO_DETECT },
                                         modifier = Modifier.size(36.dp),
-                                        enabled = isSamModelLoaded && !isScanning
+                                        enabled = isSamModelLoaded
                                     ) {
                                         Icon(
                                             Icons.Default.GridView,
@@ -1120,159 +1124,69 @@ fun InpaintScreen(
                                     )
                                 }
                             } else if (currentToolMode == ToolMode.AUTO_DETECT) {
-                                // Auto Detect mode: object gallery
-                                if (isScanning) {
-                                    Box(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .padding(horizontal = 8.dp),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Row(
-                                            verticalAlignment = Alignment.CenterVertically,
-                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                        ) {
-                                            CircularProgressIndicator(
-                                                modifier = Modifier.size(16.dp),
-                                                strokeWidth = 2.dp
-                                            )
-                                            Text(
-                                                "Scanning objects...",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                fontSize = 12.sp
-                                            )
-                                        }
-                                    }
-                                } else if (detectedObjects.isNotEmpty()) {
-                                    LazyRow(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .padding(horizontal = 4.dp),
-                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                        contentPadding = PaddingValues(horizontal = 4.dp)
-                                    ) {
-                                        items(detectedObjects) { obj ->
-                                            val isSelected = selectedObjectIds.contains(obj.id)
-                                            // Crop object thumbnail from original bitmap
-                                            val thumb = remember(obj.id) {
-                                                try {
-                                                    val bx = obj.bbox.x.coerceIn(0, originalBitmap.width - 1)
-                                                    val by = obj.bbox.y.coerceIn(0, originalBitmap.height - 1)
-                                                    val bw = min(obj.bbox.width, originalBitmap.width - bx).coerceAtLeast(1)
-                                                    val bh = min(obj.bbox.height, originalBitmap.height - by).coerceAtLeast(1)
-                                                    Bitmap.createBitmap(originalBitmap, bx, by, bw, bh)
-                                                } catch (e: Exception) {
-                                                    originalBitmap
-                                                }
-                                            }
-                                            Box(
-                                                modifier = Modifier
-                                                    .size(52.dp)
-                                                    .clip(RoundedCornerShape(8.dp))
-                                                    .border(
-                                                        width = if (isSelected) 3.dp else 1.dp,
-                                                        color = if (isSelected)
-                                                            MaterialTheme.colorScheme.primary
-                                                        else
-                                                            MaterialTheme.colorScheme.outline.copy(alpha = 0.3f),
-                                                        shape = RoundedCornerShape(8.dp)
-                                                    )
-                                                    .clickable { toggleObjectMask(obj) },
-                                                contentAlignment = Alignment.Center
-                                            ) {
-                                                Image(
-                                                    bitmap = thumb.asImageBitmap(),
-                                                    contentDescription = obj.label,
-                                                    modifier = Modifier.fillMaxSize(),
-                                                    contentScale = ContentScale.Crop
-                                                )
-                                                if (isSelected) {
-                                                    Box(
-                                                        modifier = Modifier
-                                                            .fillMaxSize()
-                                                            .background(
-                                                                MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)
-                                                            )
-                                                    )
-                                                    Icon(
-                                                        Icons.Default.Check,
-                                                        contentDescription = "Selected",
-                                                        tint = ComposeColor.White,
-                                                        modifier = Modifier.size(20.dp)
-                                                    )
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    Box(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .padding(horizontal = 8.dp),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        TextButton(onClick = { scanObjects() }) {
-                                            Text("Tap to scan objects")
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // Smart Edit prompt input (only in AUTO_DETECT mode with objects)
-                        if (currentToolMode == ToolMode.AUTO_DETECT && detectedObjects.isNotEmpty()) {
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(top = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                OutlinedTextField(
-                                    value = smartEditText,
-                                    onValueChange = { smartEditText = it },
-                                    modifier = Modifier.weight(1f),
-                                    placeholder = {
-                                        Text(
-                                            "e.g. change her eyes to red",
-                                            style = MaterialTheme.typography.bodySmall,
-                                            fontSize = 11.sp
-                                        )
-                                    },
-                                    textStyle = MaterialTheme.typography.bodySmall.copy(fontSize = 13.sp),
-                                    singleLine = true,
-                                    shape = RoundedCornerShape(12.dp),
-                                    colors = OutlinedTextFieldDefaults.colors(
-                                        focusedBorderColor = MaterialTheme.colorScheme.primary,
-                                        unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
-                                    )
-                                )
-                                Button(
-                                    onClick = { processSmartEdit() },
-                                    enabled = selectedObjectIds.isNotEmpty() && smartEditText.isNotBlank() && !isLoading,
-                                    shape = RoundedCornerShape(12.dp),
-                                    contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                                // Smart Edit: prompt-first auto-detect
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .padding(horizontal = 4.dp)
                                 ) {
-                                    Icon(
-                                        Icons.Default.AutoFixHigh,
-                                        contentDescription = "Apply Smart Edit",
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Edit", fontSize = 13.sp)
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        OutlinedTextField(
+                                            value = smartEditText,
+                                            onValueChange = {
+                                                smartEditText = it
+                                                if (it.length > 3) {
+                                                    processedPrompt = SmartPromptProcessor.process(it)
+                                                } else {
+                                                    processedPrompt = null
+                                                }
+                                            },
+                                            modifier = Modifier.weight(1f),
+                                            placeholder = {
+                                                Text(
+                                                    "e.g. change her eyes to red",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    fontSize = 11.sp
+                                                )
+                                            },
+                                            textStyle = MaterialTheme.typography.bodySmall.copy(fontSize = 13.sp),
+                                            singleLine = true,
+                                            shape = RoundedCornerShape(12.dp),
+                                            colors = OutlinedTextFieldDefaults.colors(
+                                                focusedBorderColor = MaterialTheme.colorScheme.primary,
+                                                unfocusedBorderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)
+                                            )
+                                        )
+                                        Button(
+                                            onClick = { processSmartEdit() },
+                                            enabled = smartEditText.isNotBlank() && !isLoading && !isSamProcessing,
+                                            shape = RoundedCornerShape(12.dp),
+                                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                                        ) {
+                                            Icon(
+                                                Icons.Default.AutoFixHigh,
+                                                contentDescription = "Apply Smart Edit",
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(4.dp))
+                                            Text("Go", fontSize = 13.sp)
+                                        }
+                                    }
+                                    if (processedPrompt != null) {
+                                        Text(
+                                            "Target: ${processedPrompt!!.targetRegion.label} → ${processedPrompt!!.inpaintPrompt.take(50)}...",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                                            fontSize = 10.sp,
+                                            maxLines = 1,
+                                            modifier = Modifier.padding(top = 2.dp, start = 4.dp)
+                                        )
+                                    }
                                 }
-                            }
-
-                            // Show processed prompt preview
-                            if (processedPrompt != null) {
-                                Text(
-                                    "→ ${processedPrompt!!.inpaintPrompt}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
-                                    fontSize = 10.sp,
-                                    maxLines = 2,
-                                    modifier = Modifier.padding(top = 4.dp, start = 4.dp)
-                                )
                             }
                         }
 

@@ -196,15 +196,15 @@ object SmartPromptProcessor {
         val (prompt, negative) = buildOptimizedPrompt(instruction, editType, targetKeywords, targetColor, subject)
 
         val denoise = when (editType) {
-            EditType.COLOR_CHANGE -> 0.40f
-            EditType.ENHANCEMENT -> 0.35f
-            EditType.STYLE_CHANGE -> 0.55f
-            EditType.CLOTHING_CHANGE -> 0.65f
+            EditType.COLOR_CHANGE -> 0.55f
+            EditType.ENHANCEMENT -> 0.45f
+            EditType.STYLE_CHANGE -> 0.60f
+            EditType.CLOTHING_CHANGE -> 0.70f
             EditType.REMOVAL -> 0.75f
             EditType.ADDITION -> 0.70f
-            EditType.REPLACEMENT -> 0.70f
-            EditType.POSE_CHANGE -> 0.88f
-            EditType.GENERAL -> 0.55f
+            EditType.REPLACEMENT -> 0.75f
+            EditType.POSE_CHANGE -> 0.90f
+            EditType.GENERAL -> 0.60f
         }
 
         val cfg = when (editType) {

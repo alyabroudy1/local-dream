@@ -502,32 +502,61 @@ fun InpaintScreen(
                     return@launch
                 }
 
-                // ── PASS 2: Target body part WITHIN person bbox using SAM ──
-                samLoadingMessage = "Targeting ${region.label}..."
-                val targetX = pMinX + personW * region.relativeX
-                val targetY = pMinY + personH * region.relativeY
+                val resultMask: Bitmap
 
-                val negativePoints = region.negativeOffsets.map { (nx, ny) ->
-                    Pair(pMinX + personW * nx, pMinY + personH * ny)
-                }
-                val positivePoints = listOf(Pair(targetX, targetY))
+                if (processed.editType == SmartPromptProcessor.EditType.POSE_CHANGE) {
+                    // ── POSE CHANGE: Use rectangular mask with padding ──
+                    // SAM silhouette confines the new pose to the old shape.
+                    // A padded rectangle gives room for the new pose.
+                    samLoadingMessage = "Preparing pose mask..."
+                    val pad = (personW * 0.15f).toInt()  // 15% padding
+                    val rectLeft = (pMinX - pad).coerceAtLeast(0)
+                    val rectTop = (pMinY - pad).coerceAtLeast(0)
+                    val rectRight = (pMaxX + pad).coerceAtMost(originalBitmap.width)
+                    val rectBottom = (pMaxY + pad).coerceAtMost(originalBitmap.height)
 
-                Log.i("InpaintScreen", "Pass 2: Targeting '${region.label}' at ($targetX, $targetY), ${negativePoints.size} negatives")
+                    Log.i("InpaintScreen", "Pose: rect mask ($rectLeft,$rectTop)-($rectRight,$rectBottom)")
 
-                val resultMask = if (negativePoints.isNotEmpty()) {
-                    withContext(Dispatchers.Default) {
-                        samSegmenter.segmentPrecise(originalBitmap, positivePoints, negativePoints)
+                    resultMask = Bitmap.createBitmap(originalBitmap.width, originalBitmap.height, Bitmap.Config.ARGB_8888)
+                    val maskCanvas = Canvas(resultMask)
+                    val paint = Paint().apply {
+                        color = Color.WHITE
+                        style = Paint.Style.FILL
                     }
+                    maskCanvas.drawRect(
+                        rectLeft.toFloat(), rectTop.toFloat(),
+                        rectRight.toFloat(), rectBottom.toFloat(),
+                        paint
+                    )
                 } else {
-                    withContext(Dispatchers.Default) {
-                        samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
-                    }
-                }
+                    // ── Regular edit: Use SAM for precise masking ──
+                    samLoadingMessage = "Targeting ${region.label}..."
+                    val targetX = pMinX + personW * region.relativeX
+                    val targetY = pMinY + personH * region.relativeY
 
-                if (resultMask == null) {
-                    samLoadingMessage = "Could not find ${region.label}"
-                    kotlinx.coroutines.delay(2000)
-                    return@launch
+                    val negativePoints = region.negativeOffsets.map { (nx, ny) ->
+                        Pair(pMinX + personW * nx, pMinY + personH * ny)
+                    }
+                    val positivePoints = listOf(Pair(targetX, targetY))
+
+                    Log.i("InpaintScreen", "Pass 2: Targeting '${region.label}' at ($targetX, $targetY), ${negativePoints.size} negatives")
+
+                    val samMask = if (negativePoints.isNotEmpty()) {
+                        withContext(Dispatchers.Default) {
+                            samSegmenter.segmentPrecise(originalBitmap, positivePoints, negativePoints)
+                        }
+                    } else {
+                        withContext(Dispatchers.Default) {
+                            samSegmenter.segmentAtPoint(originalBitmap, targetX, targetY)
+                        }
+                    }
+
+                    if (samMask == null) {
+                        samLoadingMessage = "Could not find ${region.label}"
+                        kotlinx.coroutines.delay(2000)
+                        return@launch
+                    }
+                    resultMask = samMask
                 }
 
                 Log.i("InpaintScreen", "Pass 2: SAM mask ${resultMask.width}x${resultMask.height}")
